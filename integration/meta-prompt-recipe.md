@@ -23,9 +23,15 @@ fi
 cd "$DEEPROUTE_DIR" && uv sync
 ```
 
-### 2. Register MCP server
+### 2. Register MCP server globally
 
-Add to `~/.claude/settings.json` under `mcpServers` (merge, don't overwrite):
+Register with `--scope user` so it's available in every project:
+
+```bash
+claude mcp add --scope user deeproute -- uv run --directory "$HOME/.claude/mcps/deeproute" python -m deeproute
+```
+
+If `claude mcp add` is not available, add to `~/.claude.json` top-level `mcpServers`:
 
 ```json
 "deeproute": {

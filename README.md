@@ -10,8 +10,8 @@ DeepRoute scans git repos, uses LLM analysis to generate a structured markdown r
 # Install
 uv sync
 
-# Register with Claude Code
-claude mcp add deeproute -- uv run --directory /path/to/deeproute python -m deeproute
+# Register globally with Claude Code (available in all projects)
+claude mcp add --scope user deeproute -- uv run --directory /path/to/deeproute python -m deeproute
 
 # Initialize on a repo (restart Claude Code first)
 # Then use the dr_init MCP tool on any repo path
