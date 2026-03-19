@@ -30,6 +30,7 @@ from .generator import (
 from .git_utils import get_git_repos_in_dir, get_head_sha, get_repo_name, is_git_repo
 from .models import HistoryEntry
 from .scanner import scan_repo
+from .integrations import integration_status
 from .skills_installer import install_skills
 from .updater import incremental_update
 
@@ -277,6 +278,7 @@ async def dr_status(path: str = "") -> dict:
         "defaults": gc.defaults.model_dump(),
         "repos": repos_status,
         "workspaces": workspaces_status,
+        "integrations": integration_status(),
     }
 
 

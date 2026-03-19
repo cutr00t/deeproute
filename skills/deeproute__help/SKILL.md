@@ -110,9 +110,21 @@ src/deeproute/
 └── skills_installer.py  # Installs Claude skills to ~/.claude/skills/
 ```
 
+## Integration with Meta-Prompt Customization System
+
+If the user has the **meta-prompt customization framework** installed (`~/.claude/commands/customize.md` or `/customize-manage`), DeepRoute integrates naturally:
+
+- **Adding DeepRoute later**: Use `/customize-manage` and ask to add codebase navigation. It knows how to install and register DeepRoute as an MCP server.
+- **Existing commands work better with DeepRoute**: Commands like `/analyze`, `/impl`, `/plan` can read `.deeproute/ROUTER.md` to orient themselves faster in unfamiliar repos. When both systems are present, suggest reading ROUTER.md before deep analysis.
+- **`/help-agent` knows about DeepRoute**: If meta-prompt's help command is installed, it can recommend `dr_query` for codebase questions and `dr_init` for new repo setup.
+- **`dr_status` shows integration state**: Run `dr_status` to see whether meta-prompt is detected and which DeepRoute skills are installed.
+
+If meta-prompt is NOT installed, DeepRoute works fully standalone — no dependencies on the customization framework.
+
 ## Tips
 
 - **Start simple**: `dr_init` on one repo, then `dr_query` to test. Expand to workspaces later.
 - **Let auto-update work**: The default `auto_update_on_query=true` keeps things fresh without manual `dr_update` calls.
 - **Read ROUTER.md directly**: The generated `.deeproute/ROUTER.md` is a great starting point even without the MCP tools — any AI assistant can read it as a file.
 - **Skills are optional**: The MCP tools work in any MCP client (Claude Code, Cursor, etc.). The Claude skills (`dr_install_skills`) just add automatic behaviors for Claude Code specifically.
+- **Works with or without meta-prompt**: DeepRoute is a standalone system. Meta-prompt integration is additive — it makes both better when they coexist.

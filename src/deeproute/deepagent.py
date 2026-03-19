@@ -126,6 +126,52 @@ would need to be consulted.
 """
 
 
+def _extract_json(raw: str) -> dict:
+    """Robustly extract JSON from LLM response, handling fences and trailing content."""
+    raw = raw.strip()
+    # Strip markdown fences
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1]
+        if "```" in raw:
+            raw = raw[:raw.rfind("```")]
+        raw = raw.strip()
+    # Try direct parse first
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # Try to find the outermost JSON object
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in response: {raw[:200]}")
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(raw[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(raw[start:i + 1])
+    # Last resort: take everything from first { to last }
+    end = raw.rfind("}")
+    if end > start:
+        return json.loads(raw[start:end + 1])
+    raise ValueError(f"Could not parse JSON from response: {raw[:200]}")
+
+
 def _truncate_inventory(inventory: RepoInventory, max_files: int = 200) -> dict:
     """Produce a trimmed inventory dict suitable for LLM context."""
     d = inventory.model_dump()
@@ -169,14 +215,7 @@ async def analyze_repo_direct(inventory: RepoInventory, model: str) -> RoutingSy
         prompt, model,
         system="You are a code analysis expert. Respond with valid JSON only."
     )
-    # Strip markdown fences if present
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        raw = raw.strip()
-    data = json.loads(raw)
+    data = _extract_json(raw)
     layers = [
         LayerDoc(name=l["name"], filename=l["filename"], content=l["content"])
         for l in data.get("layers", [])
@@ -251,12 +290,7 @@ async def _planner_node(state: AgentState) -> AgentState:
         f"{json.dumps(inv, indent=2, default=str)}"
     )
     raw = await _call_anthropic(prompt, model, system="You are a code architect. JSON only.")
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-    data = json.loads(raw)
+    data = _extract_json(raw)
     state["layers"] = [{"name": l["name"], "filename": l["filename"], "content": ""} for l in data.get("layers", [])]
     return state
 
@@ -274,12 +308,7 @@ async def _generator_node(state: AgentState) -> AgentState:
     if layers_plan:
         prompt += f"\n\nPlanned layers: {json.dumps(layers_plan)}"
     raw = await _call_anthropic(prompt, model, system="You are a code analysis expert. Respond with valid JSON only.")
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-    data = json.loads(raw)
+    data = _extract_json(raw)
     state["router_md"] = data.get("router_md", "")
     state["layers"] = data.get("layers", [])
     state["skills"] = data.get("skills", [])
@@ -300,12 +329,7 @@ async def _reviewer_node(state: AgentState) -> AgentState:
         "If issues found, respond: {\"ok\": false, \"notes\": \"...\"}"
     )
     raw = await _call_anthropic(prompt, model, system="You are a technical reviewer. JSON only.")
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-    data = json.loads(raw)
+    data = _extract_json(raw)
     state["review_notes"] = data.get("notes", "")
     state["final"] = data.get("ok", True)
     return state
