@@ -56,15 +56,43 @@ After making or pulling significant code changes in a repo with `.deeproute/`:
 4. **For workspace-level changes** (new repo added, service renamed), run `dr_workspace_init` to regenerate cross-repo routing.
 """
 
+HELP_SKILL_PATH = Path(__file__).parent.parent.parent / "skills" / "deeproute__help" / "SKILL.md"
+
+
+def _load_help_skill() -> str:
+    """Load the help skill content from the bundled SKILL.md file."""
+    if HELP_SKILL_PATH.exists():
+        return HELP_SKILL_PATH.read_text()
+    # Fallback if running from installed package without skills dir
+    return """\
+---
+name: deeproute__help
+description: Interactive help for DeepRoute — explains tools, workflows, and troubleshooting
+triggers:
+  - asking how to use deeproute
+  - confused about deeproute tools
+  - deeproute errors or unexpected behavior
+---
+
+# DeepRoute Help
+
+Use `dr_status` to check registered repos. Use `dr_init` to set up a new repo.
+Use `dr_query` to ask questions. Use `dr_update` after code changes.
+Run `dr_install_skills` to install Claude Code navigation and update skills.
+"""
+
 
 def install_skills(force: bool = False) -> dict:
     """Install DeepRoute skills into ~/.claude/skills/."""
     installed: list[str] = []
     skipped: list[str] = []
 
+    help_content = _load_help_skill()
+
     skills = {
         "deeproute__nav": NAV_SKILL,
         "deeproute__update": UPDATE_SKILL,
+        "deeproute__help": help_content,
     }
 
     for name, content in skills.items():
