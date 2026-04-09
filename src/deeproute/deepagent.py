@@ -11,7 +11,7 @@ import json
 import logging
 from typing import Any
 
-from .llm_client import get_client
+from .llm_client import get_client, get_model_fallbacks, model_display_name, resolve_model
 from .models import (
     FileChange,
     LayerDoc,
@@ -281,25 +281,52 @@ def _truncate_inventory(inventory: RepoInventory, max_files: int = 200) -> dict:
 # --- LLM call wrapper ---
 
 async def _call_llm(prompt: str, model: str, system: str = "", max_tokens: int = 8192) -> str:
-    """Make an LLM call using the auto-detected backend (Anthropic or Vertex)."""
+    """Make an LLM call with model alias resolution and 404 fallback.
+
+    Accepts aliases ("opus", "sonnet", "haiku") or full model IDs.
+    On model 404, tries fallback candidates before giving up.
+    """
     client = get_client()
+    candidates = get_model_fallbacks(resolve_model(model))
+
     messages = [{"role": "user", "content": prompt}]
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
-    if system:
-        kwargs["system"] = system
-    response = await client.messages.create(**kwargs)
-    return response.content[0].text
+
+    last_error = None
+    for candidate in candidates:
+        kwargs: dict[str, Any] = {
+            "model": candidate,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+        if system:
+            kwargs["system"] = system
+        try:
+            response = await client.messages.create(**kwargs)
+            if candidate != candidates[0]:
+                logger.info(f"Model fallback: {candidates[0]} → {candidate}")
+            return response.content[0].text
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not_found" in error_str:
+                logger.warning(f"Model {candidate} not available, trying next fallback")
+                last_error = e
+                continue
+            raise  # Non-404 errors propagate immediately
+
+    # All candidates failed
+    tried = ", ".join(candidates)
+    raise type(last_error)(
+        f"No available model found. Tried: {tried}. "
+        f"Check your config (dr_config key='model') or set a model "
+        f"available on your current backend. Last error: {last_error}"
+    ) from last_error
 
 
 # --- V1 (markdown) analysis ---
 
 async def analyze_repo(
     inventory: RepoInventory,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
 ) -> RoutingSystem:
     """Analyze a repo and produce a v1 markdown routing system."""
     inv_dict = _truncate_inventory(inventory)
@@ -332,7 +359,7 @@ async def analyze_repo(
 
 async def analyze_repo_v2(
     inventory: RepoInventory,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
 ) -> dict:
     """Analyze a repo and produce a v2 structured schema (dict).
 
@@ -355,7 +382,7 @@ async def update_module_v2(
     current_schema: dict,
     changes: list[FileChange],
     commits: list[dict[str, str]],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
 ) -> dict:
     """Update a single v2 module schema based on changes."""
     diff_summary = "\n".join(f"  {c.status.value} {c.path}" for c in changes)
@@ -375,7 +402,7 @@ async def update_layer(
     current_md: str,
     changes: list[FileChange],
     commits: list[dict[str, str]],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
 ) -> str:
     """Update a v1 layer document based on changes."""
     diff_summary = "\n".join(f"  {c.status.value} {c.path}" for c in changes)
@@ -392,7 +419,7 @@ async def query(
     question: str,
     router_md: str,
     layer_contents: dict[str, str],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
 ) -> str:
     """Answer a question using the v1 routing system."""
     layer_ctx = ""

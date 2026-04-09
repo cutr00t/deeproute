@@ -2,112 +2,159 @@
 
 Multi-layer markdown routing MCP server for agentic code assistants.
 
-DeepRoute scans git repos, uses LLM analysis to generate a structured markdown routing system (`.deeproute/`), then serves that context through MCP tools — giving AI coding assistants like Claude Code and Cursor fast, targeted access to codebase knowledge.
+DeepRoute scans git repos, uses LLM analysis to generate structured routing docs, then serves targeted codebase context through MCP tools — giving AI coding assistants fast, accurate access to project knowledge without re-scanning source files.
 
 ## Quick Start
 
 ```bash
 # Install
-uv sync
+git clone git@github.com:cutr00t/deeproute.git ~/.claude/mcps/deeproute
+cd ~/.claude/mcps/deeproute && uv sync
 
-# Register globally with Claude Code (available in all projects)
-claude mcp add --scope user deeproute -- uv run --directory /path/to/deeproute python -m deeproute
+# Register globally with Claude Code
+claude mcp add --scope user deeproute -- uv run --directory ~/.claude/mcps/deeproute python -m deeproute
 
-# Initialize on a repo (restart Claude Code first)
-# Then use the dr_init MCP tool on any repo path
+# Restart Claude Code, then initialize a repo
+# dr_init path="/path/to/your/repo"
 ```
+
+## Two Operating Modes
+
+### Agent Mode (has LLM credentials)
+Runs LLM analysis inside the MCP server. Used for `dr_init` (deep scan) and `dr_update` (incremental refresh). Auto-detects backend from environment:
+
+- **Anthropic API**: Set `ANTHROPIC_API_KEY`
+- **GCP Vertex AI**: Set `CLOUD_ML_REGION` + `ANTHROPIC_VERTEX_PROJECT_ID`
+- **Both set**: Errors with a clear message — set `DEEPROUTE_BACKEND=anthropic|vertex` to choose
+- **Neither set**: Falls to schema mode
+
+### Schema Mode (no credentials needed)
+Zero LLM calls. Programmatic tools parse structured JSON files from `.deeproute/v2/`. The primary Claude Code session (paid by your subscription) does the reasoning.
+
+Use `dr_lookup`, `dr_search`, and `dr_notes` for fast, free codebase queries.
 
 ## MCP Tools
 
+### Generation (requires LLM credentials)
+
 | Tool | Description |
 |------|-------------|
-| `dr_init` | Scan a repo, LLM-analyze it, generate `.deeproute/` routing docs |
+| `dr_init` | Scan a repo, LLM-analyze it, generate v1 markdown + v2 structured schema |
 | `dr_update` | Incremental refresh — only re-analyzes what changed (git-diff-driven) |
-| `dr_query` | Route natural-language questions through the routing system |
-| `dr_status` | Health check — registered repos, last update times |
-| `dr_register` | Add/remove repos from the global registry |
+| `dr_query` | Route a question through the LLM using routing docs as context |
+| `dr_migrate` | Upgrade a v1-only `.deeproute/` to v2 structured schema |
 | `dr_workspace_init` | Multi-repo workspace setup with cross-repo routing |
+
+### Lookup (zero cost, no credentials)
+
+| Tool | Description |
+|------|-------------|
+| `dr_lookup` | Targeted retrieval — by module, file, function, class, or section |
+| `dr_search` | Cross-cutting search by tags, text, or type across all modules |
+| `dr_notes` | Load optional freeform markdown for deeper module context |
+
+### Management
+
+| Tool | Description |
+|------|-------------|
+| `dr_status` | Health check — backend, registered repos, models, last update times |
+| `dr_register` | Add/remove repos from the global registry |
+| `dr_config` | Get/set config values (model aliases, excludes, mode, etc.) |
 | `dr_install_skills` | Install Claude Code skills for automatic nav/update behaviors |
-| `dr_config` | Get/set config values (model, excludes, etc.) |
 
-## How It Works
+## Model Configuration
 
-### 1. Init (`dr_init`)
+DeepRoute uses **model aliases** that resolve to the right ID for your backend:
 
-Scans the repo file tree, reads key files (README, pyproject.toml, Dockerfile, etc.), detects languages, and sends a structured inventory to an LLM. The LLM produces:
+```
+opus   → claude-opus-4-20250514
+sonnet → claude-sonnet-4-20250514
+haiku  → claude-haiku-4-5-20251001
+```
 
-- **ROUTER.md** — Project overview, tech stack, directory map, and a routing table mapping task types to subsystem layers
-- **layers/*.md** — Per-subsystem deep context (architecture, key files, conventions, common tasks)
+Set via MCP tools:
+```
+dr_config key="model" value="sonnet"         # default for updates/queries
+dr_config key="init_model" value="opus"      # for initial deep analysis
+```
 
-### 2. Update (`dr_update`)
-
-Uses `git diff` from the last known SHA to detect changes. Classifies them as structural (new dirs, config changes), content (source code), or minor (docs). Only refreshes affected layers.
-
-### 3. Query (`dr_query`)
-
-Loads the routing system as LLM context and answers questions with three depth levels:
-- `shallow` — ROUTER.md only (fast, for orientation)
-- `normal` — ROUTER.md + relevant layers (default)
-- `deep` — All layers loaded (for complex cross-cutting questions)
-
-### 4. Workspace Mode (`dr_workspace_init`)
-
-For multi-repo projects: discovers git repos under a directory, runs `dr_init` on each, then generates a workspace-level `ROUTER.md` with cross-repo routing.
+Full model IDs also accepted. On 404, DeepRoute tries fallback candidates before failing.
 
 ## Generated Structure
 
+### V1 (Markdown)
 ```
-repo/
-└── .deeproute/           # gitignored by default
-    ├── ROUTER.md          # routing index
-    ├── config.json        # per-repo config overrides
-    ├── history.json       # last SHA + timestamps
-    ├── layers/
-    │   ├── backend.md     # subsystem-specific context
-    │   ├── frontend.md
-    │   └── infra.md
-    └── skills/            # optional custom skills
+.deeproute/
+├── ROUTER.md          # routing index with tech stack, directory map, routing table
+├── layers/*.md        # per-subsystem context (architecture, key files, conventions)
+├── config.json        # per-repo config overrides
+└── history.json       # last SHA + timestamps
 ```
+
+### V2 (Structured JSON)
+```
+.deeproute/v2/
+├── manifest.json      # project overview, module index, tech stack, tags
+├── modules/           # one JSON per package — file roles, function specs, class specs
+│   ├── src__app.json
+│   └── tests.json
+├── interfaces.json    # HTTP endpoints, gRPC services, event handlers
+├── config_files.json  # parsed Dockerfile, docker-compose, CI summaries
+├── patterns.json      # detected design patterns with locations
+└── notes/             # optional freeform markdown for deeper context
+    └── *.md
+```
+
+V2 files are what `dr_lookup`/`dr_search` parse programmatically. V1 files are still generated for backward compatibility and human readability.
+
+## Workspace Mode
+
+For multi-repo projects (microservices, monorepo-adjacent):
+
+```
+dr_workspace_init path="/path/to/workspace"
+```
+
+Discovers git repos under the directory, initializes each, then generates a workspace-level `ROUTER.md` with cross-repo routing. All repos are registered and queryable as a unit.
 
 ## Configuration
 
-Global config lives at `~/.deeproute/config.json`. Per-repo overrides in `.deeproute/config.json`.
+Global config: `~/.deeproute/config.json`
+Per-repo overrides: `.deeproute/config.json`
 
-```bash
-# Set default model
-# (via dr_config MCP tool)
-dr_config key="model" value="claude-sonnet-4-20250514"
-
-# Set repo-specific override
-dr_config key="model_override" value="claude-haiku-4-5-20251001" scope="repo" path="/path/to/repo"
-```
-
-Key settings:
-- `model` — Default LLM model for analysis
-- `local_only` — Whether to gitignore `.deeproute/` (default: true)
-- `auto_update_on_query` — Auto-run `dr_update` before queries (default: true)
-- `exclude_patterns` — Glob patterns to skip during scanning
-- `agent_backend` — `direct` (Anthropic SDK, default) or `langgraph`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `model` | `sonnet` | Default model for updates and queries |
+| `init_model` | `sonnet` | Model for initial deep analysis (set to `opus` for richer output) |
+| `force_mode` | `null` | Force `"agent"` or `"schema"` mode (null = auto-detect) |
+| `local_only` | `true` | Gitignore `.deeproute/` |
+| `auto_update_on_query` | `true` | Auto-refresh stale repos before queries |
+| `exclude_patterns` | `[node_modules, .git, ...]` | Glob patterns to skip during scanning |
 
 ## Claude Skills
 
-`dr_install_skills` installs two namespaced skills into `~/.claude/skills/`:
+`dr_install_skills` installs three namespaced skills into `~/.claude/skills/`:
 
-- **deeproute__nav** — Progressive disclosure pattern: start with ROUTER.md, follow routing table to relevant layer, go deeper only when needed
-- **deeproute__update** — Reminds to call `dr_update` after significant code changes
+- **deeproute__nav** — Progressive disclosure: ROUTER.md → layers → source
+- **deeproute__update** — Reminds to refresh routing after code changes
+- **deeproute__help** — Interactive help, workflows, troubleshooting
 
 ## Architecture
 
 ```
 src/deeproute/
-├── server.py            # FastMCP server, all tool definitions
-├── models.py            # Pydantic models
-├── config.py            # Config load/save/merge
+├── server.py            # FastMCP server, 12 tool handlers
+├── llm_client.py        # Backend detection (Anthropic/Vertex/none), model aliases
+├── deepagent.py         # LLM analysis — v1 markdown + v2 structured schema prompts
+├── schema.py            # Pydantic models for v2 structured schema
+├── schema_reader.py     # Programmatic JSON parser for dr_lookup/dr_search
+├── models.py            # Config and data structure models
+├── config.py            # Config load/save/merge, registry
 ├── scanner.py           # Repo file tree walking, language detection
+├── generator.py         # Write .deeproute/ v1 markdown + v2 JSON
 ├── git_utils.py         # Git operations via GitPython
-├── deepagent.py         # LLM analysis (Anthropic SDK + LangGraph)
-├── generator.py         # Write .deeproute/ structure
-├── updater.py           # Incremental update logic
+├── updater.py           # Incremental git-diff-driven layer refresh
+├── integrations.py      # Cross-system detection (meta-prompt awareness)
 └── skills_installer.py  # Claude skill installation
 ```
 
@@ -115,13 +162,17 @@ src/deeproute/
 
 - Python 3.11+
 - `uv` for package management
-- `ANTHROPIC_API_KEY` environment variable
-- Git repos to analyze
+- For agent mode: `ANTHROPIC_API_KEY` or GCP Vertex AI credentials
+- For schema mode: just the generated `.deeproute/v2/` files (no credentials needed)
 
 ## Transports
 
 - **stdio** (default) — For Claude Code CLI integration
 - **HTTP** — `deeproute --http` starts on port 7432 for Cursor/other MCP clients
+
+## Meta-Prompt Integration
+
+If using the [meta-prompt customization framework](https://github.com/cutr00t/meta-prompt-claude-code-extension), DeepRoute can be installed as a companion during bootstrap or added later via `/customize-manage`. See `integration/meta-prompt-recipe.md` for details.
 
 ## License
 

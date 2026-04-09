@@ -1,10 +1,17 @@
-"""LLM client factory — supports Anthropic API, Vertex AI, and schema-only mode."""
+"""LLM client factory — supports Anthropic API, Vertex AI, and schema-only mode.
+
+Handles model alias resolution (opus/sonnet/haiku → full model IDs) and
+graceful fallback on model 404 errors.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class LLMBackend(str, Enum):
@@ -18,8 +25,85 @@ class LLMClientError(Exception):
     """Raised when LLM client cannot be constructed or backend is ambiguous."""
 
 
+# Model alias → ordered list of full IDs to try
+MODEL_ALIASES: dict[str, list[str]] = {
+    "opus": [
+        "claude-opus-4-20250514",
+    ],
+    "sonnet": [
+        "claude-sonnet-4-20250514",
+    ],
+    "haiku": [
+        "claude-haiku-4-5-20251001",
+    ],
+}
+
+# Reverse lookup: full ID → alias (for display)
+_REVERSE_ALIASES: dict[str, str] = {}
+for _alias, _ids in MODEL_ALIASES.items():
+    for _id in _ids:
+        _REVERSE_ALIASES[_id] = _alias
+
+
 _client: Any = None
 _backend: LLMBackend | None = None
+
+
+def resolve_model(model: str) -> str:
+    """Resolve a model alias to a full model ID.
+
+    Accepts:
+    - Aliases: "opus", "sonnet", "haiku"
+    - Full IDs: "claude-sonnet-4-20250514" (passed through unchanged)
+    - Partial matches: "claude-opus" → first matching alias
+
+    Returns the first candidate ID for the alias.
+    """
+    lower = model.strip().lower()
+
+    # Direct alias match
+    if lower in MODEL_ALIASES:
+        return MODEL_ALIASES[lower][0]
+
+    # Already a full ID
+    if model.startswith("claude-"):
+        return model
+
+    # Partial match (e.g., "opus-4" → try opus alias)
+    for alias in MODEL_ALIASES:
+        if alias in lower:
+            return MODEL_ALIASES[alias][0]
+
+    # Unknown — return as-is, let the API reject it with a clear error
+    return model
+
+
+def get_model_fallbacks(model: str) -> list[str]:
+    """Get ordered list of model IDs to try, including fallbacks.
+
+    For aliases, returns all candidates. For full IDs, returns [id, alias_default].
+    """
+    lower = model.strip().lower()
+
+    if lower in MODEL_ALIASES:
+        return list(MODEL_ALIASES[lower])
+
+    # For a full ID, try it first, then fall back to its alias default
+    candidates = [model]
+    alias = _REVERSE_ALIASES.get(model)
+    if alias:
+        for fallback in MODEL_ALIASES[alias]:
+            if fallback != model:
+                candidates.append(fallback)
+    return candidates
+
+
+def model_display_name(model: str) -> str:
+    """Return a human-friendly display name for a model ID."""
+    alias = _REVERSE_ALIASES.get(model)
+    if alias:
+        return f"{alias} ({model})"
+    return model
 
 
 def detect_backend() -> LLMBackend:
@@ -32,7 +116,6 @@ def detect_backend() -> LLMBackend:
     - If only API key → ANTHROPIC
     - If neither → NONE (schema mode, no LLM calls)
     """
-    # Explicit override takes precedence
     explicit = os.environ.get("DEEPROUTE_BACKEND", "").strip().lower()
     if explicit in ("anthropic", "vertex"):
         return LLMBackend(explicit)
@@ -93,7 +176,6 @@ def create_client() -> Any:
             project_id=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"),
         )
 
-    # ANTHROPIC (default)
     from anthropic import AsyncAnthropic
     return AsyncAnthropic()
 

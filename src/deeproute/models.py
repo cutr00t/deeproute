@@ -127,8 +127,8 @@ class HistoryEntry(BaseModel):
 # --- Config models ---
 
 class GlobalDefaults(BaseModel):
-    model: str = "claude-sonnet-4-20250514"
-    init_model: str = "claude-sonnet-4-20250514"
+    model: str = "sonnet"
+    init_model: str = "sonnet"
     local_only: bool = True
     auto_update_on_query: bool = True
     max_files_full_scan: int = 5000

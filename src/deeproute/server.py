@@ -26,7 +26,7 @@ from .config import (
     unregister_repo,
 )
 from .deepagent import analyze_repo, analyze_repo_v2, query
-from .llm_client import LLMBackend, get_backend
+from .llm_client import LLMBackend, get_backend, resolve_model, model_display_name
 from .generator import (
     update_gitignore,
     write_routing_system,
@@ -301,6 +301,8 @@ async def dr_status(path: str = "") -> dict:
     return {
         "defaults": gc.defaults.model_dump(),
         "llm_backend": backend,
+        "model_resolved": model_display_name(resolve_model(gc.defaults.model)),
+        "init_model_resolved": model_display_name(resolve_model(gc.defaults.init_model)),
         "repos": repos_status,
         "workspaces": workspaces_status,
         "integrations": integration_status(),
