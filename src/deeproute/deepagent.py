@@ -278,6 +278,66 @@ def _truncate_inventory(inventory: RepoInventory, max_files: int = 200) -> dict:
     return d
 
 
+# --- Session token tracking ---
+
+class TokenTracker:
+    """Session-level token usage tracking. Singleton, reset per server lifecycle."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total_input: int = 0
+        self.total_output: int = 0
+        self.calls: int = 0
+        self.by_model: dict[str, dict[str, int]] = {}
+        self.budget_limit: int | None = None  # None = unlimited
+
+    def record(self, model: str, input_tokens: int, output_tokens: int):
+        self.total_input += input_tokens
+        self.total_output += output_tokens
+        self.calls += 1
+        if model not in self.by_model:
+            self.by_model[model] = {"input": 0, "output": 0, "calls": 0}
+        self.by_model[model]["input"] += input_tokens
+        self.by_model[model]["output"] += output_tokens
+        self.by_model[model]["calls"] += 1
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_input + self.total_output
+
+    @property
+    def budget_remaining(self) -> int | None:
+        if self.budget_limit is None:
+            return None
+        return max(0, self.budget_limit - self.total_tokens)
+
+    @property
+    def budget_exceeded(self) -> bool:
+        if self.budget_limit is None:
+            return False
+        return self.total_tokens >= self.budget_limit
+
+    def summary(self) -> dict:
+        result = {
+            "total_input": self.total_input,
+            "total_output": self.total_output,
+            "total_tokens": self.total_tokens,
+            "calls": self.calls,
+            "by_model": dict(self.by_model),
+        }
+        if self.budget_limit is not None:
+            result["budget_limit"] = self.budget_limit
+            result["budget_remaining"] = self.budget_remaining
+            result["budget_exceeded"] = self.budget_exceeded
+        return result
+
+
+# Global session tracker
+token_tracker = TokenTracker()
+
+
 # --- LLM call wrapper ---
 
 async def _call_llm(prompt: str, model: str, system: str = "", max_tokens: int = 8192) -> str:
@@ -285,7 +345,16 @@ async def _call_llm(prompt: str, model: str, system: str = "", max_tokens: int =
 
     Accepts aliases ("opus", "sonnet", "haiku") or full model IDs.
     On model 404, tries fallback candidates before giving up.
+    Tracks token usage in the session tracker.
     """
+    # Budget check
+    if token_tracker.budget_exceeded:
+        raise RuntimeError(
+            f"Token budget exceeded ({token_tracker.total_tokens}/{token_tracker.budget_limit}). "
+            f"Schema-mode tools (dr_lookup/dr_search) still work. "
+            f"Increase budget via dr_config key='token_budget'."
+        )
+
     client = get_client()
     candidates = get_model_fallbacks(resolve_model(model))
 
@@ -304,6 +373,16 @@ async def _call_llm(prompt: str, model: str, system: str = "", max_tokens: int =
             response = await client.messages.create(**kwargs)
             if candidate != candidates[0]:
                 logger.info(f"Model fallback: {candidates[0]} → {candidate}")
+
+            # Track token usage
+            usage = getattr(response, "usage", None)
+            if usage:
+                token_tracker.record(
+                    model=candidate,
+                    input_tokens=getattr(usage, "input_tokens", 0),
+                    output_tokens=getattr(usage, "output_tokens", 0),
+                )
+
             return response.content[0].text
         except Exception as e:
             error_str = str(e)

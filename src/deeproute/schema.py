@@ -42,6 +42,9 @@ class Manifest(BaseModel):
     drift_score: float = 0.0
     last_factual_update: str = ""
     has_embeddings: bool = False
+    workspace_complexity: str = ""  # low, medium, high
+    recommended_init_model: str = ""
+    recommended_update_model: str = ""
 
 
 # --- Module detail ---
@@ -97,6 +100,27 @@ class CommonTask(BaseModel):
     steps: str
 
 
+class ComplexityInfo(BaseModel):
+    score: int = 0  # 1-10
+    factors: list[str] = Field(default_factory=list)
+    file_count: int = 0
+    function_count: int = 0
+    class_count: int = 0
+    public_functions: int = 0
+    avg_params: float = 0.0
+    max_params: int = 0
+    import_count: int = 0
+    cross_module_deps: int = 0
+    directory_depth: int = 0
+    async_ratio: float = 0.0
+
+
+class ModelHintsInfo(BaseModel):
+    analysis: str = "sonnet"
+    update: str = "sonnet"
+    query: str = "haiku"
+
+
 class ModuleSchema(BaseModel):
     schema_version: str = SCHEMA_VERSION
     name: str = ""
@@ -112,6 +136,8 @@ class ModuleSchema(BaseModel):
     notes_file: str = ""
     drift_score: float = 0.0
     last_factual_update: str = ""
+    complexity: ComplexityInfo = Field(default_factory=ComplexityInfo)
+    model_hints: ModelHintsInfo = Field(default_factory=ModelHintsInfo)
 
 
 # --- Interfaces ---

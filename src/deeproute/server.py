@@ -25,7 +25,7 @@ from .config import (
     set_config_value,
     unregister_repo,
 )
-from .deepagent import analyze_repo, analyze_repo_v2, query
+from .deepagent import analyze_repo, analyze_repo_v2, query, token_tracker
 from .llm_client import LLMBackend, get_backend, resolve_model, model_display_name
 from .generator import (
     update_gitignore,
@@ -41,6 +41,23 @@ from .skills_installer import install_skills
 from .updater import incremental_update
 
 mcp = FastMCP("deeproute")
+
+# Cached schema readers — avoid re-parsing JSON per tool call
+_reader_cache: dict[str, Any] = {}
+
+
+def _get_reader(repo_path: str) -> Any:
+    """Get or create a cached SchemaReader for a repo."""
+    from .schema_reader import SchemaReader
+
+    if repo_path not in _reader_cache:
+        _reader_cache[repo_path] = SchemaReader(repo_path)
+    return _reader_cache[repo_path]
+
+
+def _invalidate_reader(repo_path: str) -> None:
+    """Invalidate cached reader after schema changes (init/update)."""
+    _reader_cache.pop(repo_path, None)
 
 
 @mcp.tool()
@@ -110,7 +127,8 @@ async def dr_init(
         from .embeddings import EmbeddingStore
         from .schema_reader import SchemaReader
         if EmbeddingStore.can_generate():
-            reader = SchemaReader(str(p))
+            _invalidate_reader(str(p))  # Clear cache after init
+            reader = _get_reader(str(p))
             if reader.has_v2():
                 reader._build_search_index()
                 if reader._search_index:
@@ -340,6 +358,7 @@ async def dr_status(path: str = "") -> dict:
             "model": emb_config.get("model"),
             "dim": emb_config.get("dim"),
         },
+        "token_usage": token_tracker.summary(),
         "repos": repos_status,
         "workspaces": workspaces_status,
         "integrations": integration_status(),
@@ -408,6 +427,17 @@ async def dr_config(
     scope: 'global', 'repo', or 'workspace'
     path: required if scope is 'repo' or 'workspace'
     """
+    # Special session-level config keys
+    if key == "token_budget":
+        if value:
+            budget = int(value) if value.lower() != "none" else None
+            token_tracker.budget_limit = budget
+            return {"success": True, "action": "set", "key": key, "value": str(budget), "scope": "session"}
+        return {"success": True, "action": "get", "key": key, "value": str(token_tracker.budget_limit), "scope": "session"}
+    if key == "token_reset":
+        token_tracker.reset()
+        return {"success": True, "action": "reset", "key": key, "message": "Token tracker reset."}
+
     if value:
         set_config_value(key, value, scope, path or None)
         return {"success": True, "action": "set", "key": key, "value": value, "scope": scope}
@@ -445,7 +475,7 @@ async def dr_lookup(
     results: dict[str, Any] = {"success": True}
 
     for t in targets:
-        reader = SchemaReader(t)
+        reader = _get_reader(t)
         if not reader.has_v2():
             results[Path(t).name] = {"error": "No v2 schema. Run dr_init or dr_migrate."}
             continue
@@ -512,7 +542,7 @@ async def dr_search(
 
     all_results: list[dict] = []
     for t in targets:
-        reader = SchemaReader(t)
+        reader = _get_reader(t)
         if not reader.has_v2():
             continue
         matches = reader.search(
@@ -548,7 +578,7 @@ async def dr_notes(
         return {"success": False, "error": "No repos registered."}
 
     for t in targets:
-        reader = SchemaReader(t)
+        reader = _get_reader(t)
         if not reader.has_v2():
             continue
         if module:
@@ -563,6 +593,114 @@ async def dr_notes(
                 return {"success": True, "available_notes": available}
 
     return {"success": False, "error": f"No notes found for module '{module}'."}
+
+
+@mcp.tool()
+async def dr_plan(
+    path: str = "",
+    action: str = "init",
+    auto_approve: bool = False,
+) -> dict:
+    """Generate a costed execution plan for workspace operations.
+
+    Reads complexity scores and model hints from v2 schemas, then proposes
+    per-repo model selection with token and cost estimates.
+
+    action: "init" (full scan), "update" (incremental), "query" (question routing)
+    auto_approve: if True, execute immediately; otherwise return plan for review
+    """
+    from .complexity import estimate_tokens, estimate_cost
+    from .schema_reader import SchemaReader
+
+    gc = load_global_config()
+
+    if path:
+        targets = [str(Path(path).resolve())]
+        # If path is a workspace, expand to its repos
+        for wp, entry in gc.workspaces.items():
+            if str(Path(path).resolve()) == wp:
+                targets = entry.repos
+                break
+    else:
+        targets = list(gc.repos.keys())
+
+    if not targets:
+        return {"success": False, "error": "No repos registered. Run dr_init first."}
+
+    plan_items = []
+    total_tokens = 0
+    total_cost = 0.0
+
+    for t in targets:
+        repo_name = Path(t).name
+        reader = _get_reader(t)
+
+        if not reader.has_v2():
+            # No schema — needs full init regardless
+            plan_items.append({
+                "repo": repo_name,
+                "path": t,
+                "model": gc.defaults.init_model,
+                "est_tokens": 5000,
+                "est_cost": round(estimate_cost(5000, gc.defaults.init_model), 4),
+                "reason": "no v2 schema — needs full init",
+                "action": "init",
+            })
+            total_tokens += 5000
+            total_cost += estimate_cost(5000, gc.defaults.init_model)
+            continue
+
+        # Read module complexity scores
+        manifest = reader.load_manifest()
+        modules = reader.load_all_modules()
+
+        for mod_name, mod in modules.items():
+            complexity = mod.complexity
+            hints = mod.model_hints
+
+            # Determine model for this action
+            if action == "init":
+                model = hints.analysis
+            elif action == "update":
+                # Check drift — if low, might skip
+                if mod.drift_score < 0.1 and action == "update":
+                    continue  # No meaningful changes
+                model = hints.update
+            else:
+                model = hints.query
+
+            tokens = estimate_tokens(complexity.model_dump(), action)
+            cost = estimate_cost(tokens, model)
+
+            factors_str = ", ".join(complexity.factors) if complexity.factors else f"score {complexity.score}/10"
+
+            plan_items.append({
+                "repo": repo_name,
+                "module": mod_name,
+                "model": model,
+                "complexity_score": complexity.score,
+                "est_tokens": tokens,
+                "est_cost": round(cost, 4),
+                "reason": factors_str,
+                "action": action,
+            })
+            total_tokens += tokens
+            total_cost += cost
+
+    result = {
+        "success": True,
+        "action": action,
+        "plan": plan_items,
+        "total_est_tokens": total_tokens,
+        "total_est_cost": f"${total_cost:.4f}",
+        "repos": len(targets),
+        "auto_approve": auto_approve,
+    }
+
+    if not plan_items:
+        result["message"] = "Nothing to do — all modules are up to date."
+
+    return result
 
 
 @mcp.tool()

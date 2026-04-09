@@ -45,7 +45,7 @@ Users set `model: "sonnet"` in config. The client resolves the alias to whatever
 
 ## Phase 2: Complexity-Aware Model Hints + dr_plan
 
-**Status: Design**
+**Status: Complete**
 
 ### Concept
 During `dr_init`, the analysis captures complexity metrics per module. These metrics inform model selection for subsequent operations — a simple utils module doesn't need Opus, but a complex distributed auth system does.
@@ -336,7 +336,12 @@ _Updated as we build and use the system._
 - **Uncommitted diff support is important**: Without it, the schema drifts during active development. With it, `dr_update` can refresh factual data even between commits.
 
 ### Phase 2
-- (future)
+- **Complexity scoring is programmatic and accurate**: Uses AST data (function count, param complexity, import depth, coupling, async ratio) with weighted sigmoid normalization → 1-10 score. Validated on deeproute itself: core module scores 4/10 (moderate), tests 1/10 (trivial). The scoring dimensions correctly capture meaningful complexity differences.
+- **Model hints map cleanly from scores**: score 1-3 → haiku, 4-5 → sonnet/haiku, 6-7 → sonnet, 8-10 → opus/sonnet. This tiering feels right — a simple utils module should never burn Opus tokens.
+- **Token estimation is rough but directional**: ~50 tokens/function for init, ~20 for updates, ~100/file for content. Good enough for cost planning. Actual usage tracking via `TokenTracker` will give us empirical correction data over time.
+- **dr_plan produces actionable plans**: Per-module model selection + token + cost estimates in a reviewable format. The `auto_approve` config bridges the gap between "always ask" and "just run it."
+- **Cached schema readers reduce I/O**: `_get_reader()` singleton cache means repeated searches within a session don't re-parse JSON files. Invalidated after init/update.
+- **Token budget enforcement is a safety net, not a wall**: Budget check happens before each `_call_llm` call. When exceeded, schema-mode tools (dr_lookup/dr_search) still work — only LLM calls are gated. This preserves the "zero cost" schema mode guarantee.
 
 ### Phase 3
 - (future)

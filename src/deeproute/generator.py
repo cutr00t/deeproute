@@ -190,6 +190,27 @@ def _merge_ast_into_module(
     mod_data["drift_score"] = 0.0
     mod_data["last_factual_update"] = _now_iso()
 
+    # Compute complexity score from AST data
+    if module_file_indexes:
+        from .complexity import compute_factors, score_module
+        factors = compute_factors(module_file_indexes, module_path)
+        score = score_module(factors)
+        mod_data["complexity"] = {
+            "score": score.score,
+            "factors": score.factors,
+            "file_count": factors.file_count,
+            "function_count": factors.function_count,
+            "class_count": factors.class_count,
+            "public_functions": factors.public_functions,
+            "avg_params": factors.avg_params,
+            "max_params": factors.max_params,
+            "import_count": factors.import_count,
+            "cross_module_deps": factors.cross_module_deps,
+            "directory_depth": factors.directory_depth,
+            "async_ratio": factors.async_ratio,
+        }
+        mod_data["model_hints"] = score.model_hints
+
     return mod_data
 
 
@@ -243,32 +264,58 @@ def write_v2_schema(
     notes = v2_data.get("notes", {})
     manifest["has_notes"] = bool(notes)
 
-    manifest_path = root / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    written.append(str(manifest_path))
-
-    # Modules (with optional AST merge)
+    # Modules (with optional AST merge + complexity scoring)
     modules_dir = root / "modules"
     modules_dir.mkdir(exist_ok=True)
+    module_scores: list[int] = []
+    module_hints: list[dict] = []
+
     for mod_name, mod_data in modules_data.items():
         if isinstance(mod_data, dict):
             mod_data["schema_version"] = "2.0.0"
             if "name" not in mod_data:
                 mod_data["name"] = mod_name
 
-            # Merge AST data if available
+            # Merge AST data if available (also computes complexity)
             if ast_indexes:
-                mod_path = mod_data.get("path", mod_name)
+                mod_path_str = mod_data.get("path", mod_name)
                 mod_data = _merge_ast_into_module(
-                    mod_data, ast_indexes, mod_path, Path(repo_path),
+                    mod_data, ast_indexes, mod_path_str, Path(repo_path),
                 )
 
             if notes.get(mod_name):
                 mod_data["notes_file"] = f"notes/{mod_name.replace('/', '__')}.md"
+
+            # Collect complexity for manifest rollup
+            complexity = mod_data.get("complexity", {})
+            if complexity.get("score"):
+                module_scores.append(complexity["score"])
+                module_hints.append(mod_data.get("model_hints", {}))
+
             filename = mod_name.replace("/", "__") + ".json"
             mod_path = modules_dir / filename
             mod_path.write_text(json.dumps(mod_data, indent=2) + "\n")
             written.append(str(mod_path))
+
+    # Workspace-level complexity in manifest (derived from module scores)
+    if module_scores:
+        max_score = max(module_scores)
+        avg_score = sum(module_scores) / len(module_scores)
+        if max_score >= 7:
+            manifest["workspace_complexity"] = "high"
+        elif avg_score >= 4:
+            manifest["workspace_complexity"] = "medium"
+        else:
+            manifest["workspace_complexity"] = "low"
+
+        # Recommended models = whatever the highest-complexity module needs
+        highest_hints = module_hints[module_scores.index(max_score)] if module_hints else {}
+        manifest["recommended_init_model"] = highest_hints.get("analysis", "sonnet")
+        manifest["recommended_update_model"] = highest_hints.get("update", "sonnet")
+
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    written.append(str(manifest_path))
 
     # Interfaces
     interfaces = v2_data.get("interfaces", {})
