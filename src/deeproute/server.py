@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -21,10 +25,12 @@ from .config import (
     set_config_value,
     unregister_repo,
 )
-from .deepagent import analyze_repo, query
+from .deepagent import analyze_repo, analyze_repo_v2, query
+from .llm_client import LLMBackend, get_backend
 from .generator import (
     update_gitignore,
     write_routing_system,
+    write_v2_schema,
     write_workspace_router,
 )
 from .git_utils import get_git_repos_in_dir, get_head_sha, get_repo_name, is_git_repo
@@ -66,17 +72,27 @@ async def dr_init(
         return {"success": False, "error": f"Not a git repo: {p}"}
 
     effective_model = model or get_effective_model(str(p))
-    gc = load_global_config()
-    backend = gc.defaults.agent_backend.value
 
     # Scan
     inventory = scan_repo(str(p))
 
-    # Analyze
-    routing_system = await analyze_repo(inventory, effective_model, backend)
+    # Determine models
+    gc = load_global_config()
+    init_model = model or gc.defaults.init_model or effective_model
 
-    # Write
+    # Analyze v1 (markdown)
+    routing_system = await analyze_repo(inventory, effective_model)
+
+    # Write v1
     written = write_routing_system(str(p), routing_system)
+
+    # Analyze + write v2 (structured schema)
+    v2_written: list[str] = []
+    try:
+        v2_data = await analyze_repo_v2(inventory, init_model)
+        v2_written = write_v2_schema(str(p), v2_data, init_model)
+    except Exception as e:
+        logger.warning(f"v2 schema generation failed (v1 still written): {e}")
 
     # History
     head_sha = get_head_sha(str(p))
@@ -100,9 +116,11 @@ async def dr_init(
         "path": str(p),
         "files_scanned": inventory.total_files,
         "languages": inventory.languages,
-        "files_written": written,
+        "files_written": written + v2_written,
         "layers": [l.filename for l in routing_system.layers],
+        "v2_files": v2_written,
         "model_used": effective_model,
+        "init_model": init_model,
     }
 
 
@@ -274,8 +292,15 @@ async def dr_status(path: str = "") -> dict:
             "last_init": entry.last_init,
         }
 
+    # Detect LLM backend
+    try:
+        backend = get_backend().value
+    except Exception:
+        backend = "unknown"
+
     return {
         "defaults": gc.defaults.model_dump(),
+        "llm_backend": backend,
         "repos": repos_status,
         "workspaces": workspaces_status,
         "integrations": integration_status(),
@@ -350,6 +375,186 @@ async def dr_config(
     else:
         current = get_config_value(key, scope, path or None)
         return {"success": True, "action": "get", "key": key, "value": current, "scope": scope}
+
+
+@mcp.tool()
+async def dr_lookup(
+    path: str = "",
+    module: str = "",
+    file: str = "",
+    function: str = "",
+    class_name: str = "",
+    section: str = "",
+) -> dict:
+    """Look up specific structural information from the v2 DeepRoute schema.
+
+    Zero LLM calls — programmatic JSON parsing only.
+
+    section: "manifest", "interfaces", "patterns", "config_files"
+    module: module name, e.g. "src/app/routes"
+    file: specific file path to look up
+    function: function name to find across all modules
+    class_name: class name to find across all modules
+    """
+    from .schema_reader import SchemaReader
+
+    gc = load_global_config()
+    targets = [str(Path(path).resolve())] if path else list(gc.repos.keys())
+    if not targets:
+        return {"success": False, "error": "No repos registered. Run dr_init first."}
+
+    results: dict[str, Any] = {"success": True}
+
+    for t in targets:
+        reader = SchemaReader(t)
+        if not reader.has_v2():
+            results[Path(t).name] = {"error": "No v2 schema. Run dr_init or dr_migrate."}
+            continue
+
+        repo_name = Path(t).name
+        try:
+            if section == "manifest":
+                results[repo_name] = reader.load_manifest().model_dump()
+            elif section == "interfaces":
+                results[repo_name] = reader.load_interfaces().model_dump()
+            elif section == "patterns":
+                results[repo_name] = reader.load_patterns().model_dump()
+            elif section == "config_files":
+                results[repo_name] = reader.load_config_files().model_dump()
+            elif module:
+                mod = reader.load_module(module)
+                if mod:
+                    results[repo_name] = mod.model_dump()
+                else:
+                    results[repo_name] = {
+                        "error": f"Module '{module}' not found.",
+                        "available": reader.list_modules(),
+                    }
+            elif file:
+                result = reader.lookup_file(file)
+                results[repo_name] = result or {"error": f"File '{file}' not found in schema."}
+            elif function:
+                results[repo_name] = {"matches": reader.lookup_function(function)}
+            elif class_name:
+                results[repo_name] = {"matches": reader.lookup_class(class_name)}
+            else:
+                # Default: return manifest summary
+                results[repo_name] = reader.load_manifest().model_dump()
+        except FileNotFoundError as e:
+            results[repo_name] = {"error": str(e)}
+
+    return results
+
+
+@mcp.tool()
+async def dr_search(
+    path: str = "",
+    query: str = "",
+    tags: list[str] | None = None,
+    type: str = "",
+    limit: int = 20,
+) -> dict:
+    """Search across the v2 structured schema by tags, types, or text.
+
+    Zero LLM calls — programmatic index search only.
+
+    type: "function", "class", "file", "endpoint", "pattern", "module"
+    tags: filter by tags, e.g. ["auth", "api"]
+    query: text search across names, descriptions, tags
+    """
+    from .schema_reader import SchemaReader
+
+    gc = load_global_config()
+    targets = [str(Path(path).resolve())] if path else list(gc.repos.keys())
+    if not targets:
+        return {"success": False, "error": "No repos registered."}
+
+    all_results: list[dict] = []
+    for t in targets:
+        reader = SchemaReader(t)
+        if not reader.has_v2():
+            continue
+        matches = reader.search(query=query, tags=tags, item_type=type, limit=limit)
+        for m in matches:
+            m["_repo"] = Path(t).name
+        all_results.extend(matches)
+
+    return {
+        "success": True,
+        "results": all_results[:limit],
+        "total": len(all_results),
+    }
+
+
+@mcp.tool()
+async def dr_notes(
+    path: str = "",
+    module: str = "",
+) -> dict:
+    """Load freeform markdown notes for deeper context on a module.
+
+    Zero LLM calls. Use after dr_lookup when you need more narrative
+    context than the structured schema provides.
+    """
+    from .schema_reader import SchemaReader
+
+    gc = load_global_config()
+    targets = [str(Path(path).resolve())] if path else list(gc.repos.keys())
+    if not targets:
+        return {"success": False, "error": "No repos registered."}
+
+    for t in targets:
+        reader = SchemaReader(t)
+        if not reader.has_v2():
+            continue
+        if module:
+            content = reader.load_notes(module)
+            if content:
+                return {"success": True, "module": module, "notes": content}
+        else:
+            # List available notes
+            notes_dir = reader.v2_dir / "notes"
+            if notes_dir.is_dir():
+                available = [f.stem.replace("__", "/") for f in notes_dir.iterdir() if f.suffix == ".md"]
+                return {"success": True, "available_notes": available}
+
+    return {"success": False, "error": f"No notes found for module '{module}'."}
+
+
+@mcp.tool()
+async def dr_migrate(path: str) -> dict:
+    """Migrate a v1 .deeproute/ directory to v2 structured schema.
+
+    Requires LLM credentials. Reads existing ROUTER.md + layers/*.md,
+    re-analyzes with the structured schema prompt, and writes v2/ files.
+    Preserves v1 files for backward compatibility.
+    """
+    from .generator import write_v2_schema
+
+    p = Path(path).resolve()
+    dr_dir = p / DEEPROUTE_DIR
+    if not dr_dir.exists():
+        return {"success": False, "error": f"No .deeproute/ found at {p}. Run dr_init first."}
+
+    v2_dir = dr_dir / "v2"
+    if v2_dir.exists():
+        return {"success": False, "error": "v2 schema already exists. Use dr_update to refresh."}
+
+    # Scan and analyze with v2 prompt
+    gc = load_global_config()
+    model = gc.defaults.init_model
+    inventory = scan_repo(str(p))
+    v2_data = await analyze_repo_v2(inventory, model)
+
+    # Write v2 files
+    written = write_v2_schema(str(p), v2_data, model)
+
+    return {
+        "success": True,
+        "path": str(p),
+        "files_written": written,
+        "model_used": model,
+    }
 
 
 def main():

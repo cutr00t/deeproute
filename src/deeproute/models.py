@@ -40,9 +40,9 @@ class ChangeImpactLevel(str, Enum):
     MINOR = "minor"
 
 
-class AgentBackend(str, Enum):
-    LANGGRAPH = "langgraph"
-    DIRECT = "direct"
+class ForceMode(str, Enum):
+    AGENT = "agent"
+    SCHEMA = "schema"
 
 
 # --- Scanner models ---
@@ -128,6 +128,7 @@ class HistoryEntry(BaseModel):
 
 class GlobalDefaults(BaseModel):
     model: str = "claude-sonnet-4-20250514"
+    init_model: str = "claude-sonnet-4-20250514"
     local_only: bool = True
     auto_update_on_query: bool = True
     max_files_full_scan: int = 5000
@@ -137,7 +138,7 @@ class GlobalDefaults(BaseModel):
             "dist", "build", ".venv", "venv", ".tox",
         ]
     )
-    agent_backend: AgentBackend = AgentBackend.DIRECT
+    force_mode: ForceMode | None = None
 
 
 class RepoEntry(BaseModel):

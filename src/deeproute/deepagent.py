@@ -1,16 +1,17 @@
 """DeepAgent — LLM-powered analysis for repo routing generation.
 
-Supports two backends:
-  - "direct": Anthropic SDK calls (simpler, fewer deps)
-  - "langgraph": LangGraph StateGraph with planner/generator/reviewer
+Uses the Anthropic SDK (AsyncAnthropic or AsyncAnthropicVertex) via
+llm_client for backend-aware client creation. Supports both v1 (freeform
+markdown) and v2 (structured JSON schema) output.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, TypedDict
+from typing import Any
 
+from .llm_client import get_client
 from .models import (
     FileChange,
     LayerDoc,
@@ -21,7 +22,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# --- Prompt templates ---
+# --- Prompt templates (v1 markdown) ---
 
 ROUTER_TEMPLATE = """\
 # Project Router — {project_name}
@@ -126,21 +127,115 @@ would need to be consulted.
 """
 
 
+# --- V2 structured schema prompt ---
+
+V2_INIT_PROMPT = """\
+You are analyzing a software repository to create a structured JSON schema for code navigation.
+
+Repository inventory:
+{inventory_json}
+
+Generate a JSON response with these exact top-level keys:
+
+1. "manifest": {{
+     "project_name": "<name>",
+     "description": "<1-2 sentence description>",
+     "tech_stack": [{{"category": "<language|framework|database|infra|ci|tool>", "name": "<name>", "version": "<version or empty>"}}],
+     "modules": [{{"name": "<path>", "summary": "<1 sentence>", "tags": ["<tag>"], "primary_language": "<lang>", "file_count": <n>}}],
+     "conventions": ["<brief coding standard>"],
+     "tree_summary": "<2-level directory tree>"
+   }}
+
+2. "modules": {{
+     "<module_path>": {{
+       "name": "<module_path>",
+       "path": "<directory path>",
+       "summary": "<1 sentence>",
+       "purpose": "<2-3 sentences>",
+       "tags": ["<tag>"],
+       "files": [{{"path": "<relative path>", "role": "<brief role>", "tags": ["<tag>"], "functions": ["<fn_name>"], "classes": ["<class_name>"]}}],
+       "functions": [{{
+         "name": "<fn_name>", "file": "<path>", "line": <n>,
+         "params": [{{"name": "<name>", "type": "<type>", "description": "<brief>"}}],
+         "return_type": "<type>", "description": "<1 sentence>",
+         "tags": ["<tag>"], "is_public": true
+       }}],
+       "classes": [{{
+         "name": "<class_name>", "file": "<path>", "line": <n>,
+         "description": "<1 sentence>", "bases": ["<base>"],
+         "key_methods": [<same as function spec>],
+         "tags": ["<tag>"]
+       }}],
+       "dependencies": [{{"module": "<other module>", "relationship": "<imports|calls|extends>", "description": "<brief>"}}],
+       "common_tasks": [{{"task": "<what>", "steps": "<how>"}}]
+     }}
+   }}
+
+3. "interfaces": {{
+     "http_endpoints": [{{"method": "<GET|POST|...>", "path": "<url>", "handler": "<file:function>", "description": "<brief>", "request_body": "<brief schema>", "response": "<brief schema>", "tags": ["<tag>"]}}],
+     "grpc_services": [],
+     "event_handlers": [{{"event": "<event_name>", "handler": "<file:function>", "source": "<pubsub|celery|kafka>", "description": "<brief>"}}],
+     "cli_commands": []
+   }}
+
+4. "config_files": {{
+     "files": [{{"file": "<path>", "type": "<dockerfile|docker-compose|ci|terraform|pyproject>", "summary": "<1 sentence>"}}],
+     "docker_stages": [{{"name": "<stage>", "base_image": "<image>", "purpose": "<brief>"}}],
+     "compose_services": [{{"name": "<svc>", "image": "<img>", "ports": ["<port>"], "depends_on": ["<dep>"], "purpose": "<brief>"}}],
+     "ci_pipelines": [{{"name": "<step>", "trigger": "<when>", "actions": ["<action>"]}}]
+   }}
+
+5. "patterns": {{
+     "patterns": [{{"name": "<pattern name>", "category": "<architectural|structural|behavioral>", "locations": ["<file paths>"], "description": "<brief>", "tags": ["<tag>"]}}]
+   }}
+
+6. "notes": {{
+     "<module_path>": "<optional freeform markdown with deeper architectural context, design decisions, or explanations that don't fit the structured schema>"
+   }}
+
+Rules:
+- Be thorough on function/class specs — include ALL public functions and classes
+- Tags should enable cross-cutting search (e.g., "auth" on auth-related items across ALL modules)
+- Keep descriptions concise (1 sentence for functions, 2-3 for modules)
+- File paths must be relative to repo root
+- For functions: include accurate parameter types and return types where detectable
+- For config files: extract the most operationally useful information
+- Respond with valid JSON only. No markdown fences.
+"""
+
+V2_UPDATE_PROMPT = """\
+You are updating a structured JSON schema for a code module based on recent changes.
+
+Current module schema:
+{current_schema_json}
+
+Git changes since last update:
+{diff_summary}
+
+Commit messages:
+{commit_messages}
+
+Update the module schema to reflect these changes. Rules:
+- Add new files/functions/classes that were added
+- Remove entries for deleted files/functions/classes
+- Update descriptions and tags if behavior changed
+- Preserve unchanged entries exactly
+- Respond with valid JSON only matching the original structure. No markdown fences.
+"""
+
+
 def _extract_json(raw: str) -> dict:
     """Robustly extract JSON from LLM response, handling fences and trailing content."""
     raw = raw.strip()
-    # Strip markdown fences
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         if "```" in raw:
             raw = raw[:raw.rfind("```")]
         raw = raw.strip()
-    # Try direct parse first
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Try to find the outermost JSON object
     start = raw.find("{")
     if start == -1:
         raise ValueError(f"No JSON object found in response: {raw[:200]}")
@@ -165,7 +260,6 @@ def _extract_json(raw: str) -> dict:
             depth -= 1
             if depth == 0:
                 return json.loads(raw[start:i + 1])
-    # Last resort: take everything from first { to last }
     end = raw.rfind("}")
     if end > start:
         return json.loads(raw[start:end + 1])
@@ -178,23 +272,21 @@ def _truncate_inventory(inventory: RepoInventory, max_files: int = 200) -> dict:
     if len(d["files"]) > max_files:
         d["files"] = d["files"][:max_files]
         d["_note"] = f"Truncated to {max_files} of {inventory.total_files} files"
-    # Truncate key file contents to avoid blowing context
     for k, v in list(d["key_files"].items()):
         if len(v) > 3000:
             d["key_files"][k] = v[:3000] + "\n... (truncated)"
     return d
 
 
-# --- Direct backend (Anthropic SDK) ---
+# --- LLM call wrapper ---
 
-async def _call_anthropic(prompt: str, model: str, system: str = "") -> str:
-    """Make a direct Anthropic API call."""
-    import anthropic
-    client = anthropic.AsyncAnthropic()
+async def _call_llm(prompt: str, model: str, system: str = "", max_tokens: int = 8192) -> str:
+    """Make an LLM call using the auto-detected backend (Anthropic or Vertex)."""
+    client = get_client()
     messages = [{"role": "user", "content": prompt}]
     kwargs: dict[str, Any] = {
         "model": model,
-        "max_tokens": 8192,
+        "max_tokens": max_tokens,
         "messages": messages,
     }
     if system:
@@ -203,15 +295,20 @@ async def _call_anthropic(prompt: str, model: str, system: str = "") -> str:
     return response.content[0].text
 
 
-async def analyze_repo_direct(inventory: RepoInventory, model: str) -> RoutingSystem:
-    """Analyze a repo using direct Anthropic API calls."""
+# --- V1 (markdown) analysis ---
+
+async def analyze_repo(
+    inventory: RepoInventory,
+    model: str = "claude-sonnet-4-20250514",
+) -> RoutingSystem:
+    """Analyze a repo and produce a v1 markdown routing system."""
     inv_dict = _truncate_inventory(inventory)
     prompt = FULL_SCAN_PROMPT.format(
         inventory_json=json.dumps(inv_dict, indent=2, default=str),
         router_template=ROUTER_TEMPLATE.format(project_name=inventory.name),
         layer_template=LAYER_TEMPLATE.format(subsystem_name="{subsystem}"),
     )
-    raw = await _call_anthropic(
+    raw = await _call_llm(
         prompt, model,
         system="You are a code analysis expert. Respond with valid JSON only."
     )
@@ -231,13 +328,56 @@ async def analyze_repo_direct(inventory: RepoInventory, model: str) -> RoutingSy
     )
 
 
-async def update_layer_direct(
+# --- V2 (structured schema) analysis ---
+
+async def analyze_repo_v2(
+    inventory: RepoInventory,
+    model: str = "claude-sonnet-4-20250514",
+) -> dict:
+    """Analyze a repo and produce a v2 structured schema (dict).
+
+    Returns the raw parsed JSON dict with keys:
+    manifest, modules, interfaces, config_files, patterns, notes
+    """
+    inv_dict = _truncate_inventory(inventory, max_files=300)
+    prompt = V2_INIT_PROMPT.format(
+        inventory_json=json.dumps(inv_dict, indent=2, default=str),
+    )
+    raw = await _call_llm(
+        prompt, model,
+        system="You are a thorough code analysis expert. Respond with valid JSON only.",
+        max_tokens=16384,
+    )
+    return _extract_json(raw)
+
+
+async def update_module_v2(
+    current_schema: dict,
+    changes: list[FileChange],
+    commits: list[dict[str, str]],
+    model: str = "claude-sonnet-4-20250514",
+) -> dict:
+    """Update a single v2 module schema based on changes."""
+    diff_summary = "\n".join(f"  {c.status.value} {c.path}" for c in changes)
+    commit_msgs = "\n".join(f"  {c.get('sha', '')}: {c.get('message', '')}" for c in commits)
+    prompt = V2_UPDATE_PROMPT.format(
+        current_schema_json=json.dumps(current_schema, indent=2),
+        diff_summary=diff_summary,
+        commit_messages=commit_msgs,
+    )
+    raw = await _call_llm(prompt, model)
+    return _extract_json(raw)
+
+
+# --- V1 update + query (unchanged behavior) ---
+
+async def update_layer(
     current_md: str,
     changes: list[FileChange],
     commits: list[dict[str, str]],
-    model: str,
+    model: str = "claude-sonnet-4-20250514",
 ) -> str:
-    """Update a single layer using direct Anthropic API call."""
+    """Update a v1 layer document based on changes."""
     diff_summary = "\n".join(f"  {c.status.value} {c.path}" for c in changes)
     commit_msgs = "\n".join(f"  {c.get('sha', '')}: {c.get('message', '')}" for c in commits)
     prompt = UPDATE_PROMPT.format(
@@ -245,16 +385,16 @@ async def update_layer_direct(
         diff_summary=diff_summary,
         commit_messages=commit_msgs,
     )
-    return await _call_anthropic(prompt, model)
+    return await _call_llm(prompt, model)
 
 
-async def query_direct(
+async def query(
     question: str,
     router_md: str,
     layer_contents: dict[str, str],
-    model: str,
+    model: str = "claude-sonnet-4-20250514",
 ) -> str:
-    """Answer a query using the routing system as context."""
+    """Answer a question using the v1 routing system."""
     layer_ctx = ""
     for name, content in layer_contents.items():
         layer_ctx += f"\n--- Layer: {name} ---\n{content}\n"
@@ -265,145 +405,4 @@ async def query_direct(
         layer_context=layer_ctx,
         question=question,
     )
-    return await _call_anthropic(prompt, model)
-
-
-# --- LangGraph backend ---
-
-class AgentState(TypedDict, total=False):
-    inventory: dict
-    router_md: str
-    layers: list[dict]
-    skills: list[dict]
-    review_notes: str
-    model: str
-    final: bool
-
-
-async def _planner_node(state: AgentState) -> AgentState:
-    """Plan which layers to generate based on repo inventory."""
-    inv = state["inventory"]
-    model = state.get("model", "claude-sonnet-4-20250514")
-    prompt = (
-        "Given this repo inventory, list the layer documents needed.\n"
-        "Respond as JSON: {\"layers\": [{\"name\": ..., \"filename\": ...}]}\n\n"
-        f"{json.dumps(inv, indent=2, default=str)}"
-    )
-    raw = await _call_anthropic(prompt, model, system="You are a code architect. JSON only.")
-    data = _extract_json(raw)
-    state["layers"] = [{"name": l["name"], "filename": l["filename"], "content": ""} for l in data.get("layers", [])]
-    return state
-
-
-async def _generator_node(state: AgentState) -> AgentState:
-    """Generate router + layer content."""
-    inv = state["inventory"]
-    model = state.get("model", "claude-sonnet-4-20250514")
-    layers_plan = state.get("layers", [])
-    prompt = FULL_SCAN_PROMPT.format(
-        inventory_json=json.dumps(inv, indent=2, default=str),
-        router_template=ROUTER_TEMPLATE.format(project_name=inv.get("name", "project")),
-        layer_template=LAYER_TEMPLATE.format(subsystem_name="{subsystem}"),
-    )
-    if layers_plan:
-        prompt += f"\n\nPlanned layers: {json.dumps(layers_plan)}"
-    raw = await _call_anthropic(prompt, model, system="You are a code analysis expert. Respond with valid JSON only.")
-    data = _extract_json(raw)
-    state["router_md"] = data.get("router_md", "")
-    state["layers"] = data.get("layers", [])
-    state["skills"] = data.get("skills", [])
-    return state
-
-
-async def _reviewer_node(state: AgentState) -> AgentState:
-    """Review generated content for coherence."""
-    model = state.get("model", "claude-sonnet-4-20250514")
-    prompt = (
-        "Review this routing system for coherence. Check:\n"
-        "1. Router table references match layer filenames\n"
-        "2. Key paths don't overlap between layers\n"
-        "3. Content is concise and actionable\n\n"
-        f"Router:\n{state.get('router_md', '')}\n\n"
-        f"Layers: {json.dumps(state.get('layers', []), indent=2)}\n\n"
-        "If everything is coherent, respond: {\"ok\": true}\n"
-        "If issues found, respond: {\"ok\": false, \"notes\": \"...\"}"
-    )
-    raw = await _call_anthropic(prompt, model, system="You are a technical reviewer. JSON only.")
-    data = _extract_json(raw)
-    state["review_notes"] = data.get("notes", "")
-    state["final"] = data.get("ok", True)
-    return state
-
-
-async def analyze_repo_langgraph(inventory: RepoInventory, model: str) -> RoutingSystem:
-    """Analyze a repo using LangGraph StateGraph."""
-    try:
-        from langgraph.graph import StateGraph, END
-    except ImportError:
-        logger.warning("langgraph not available, falling back to direct")
-        return await analyze_repo_direct(inventory, model)
-
-    inv_dict = _truncate_inventory(inventory)
-
-    graph = StateGraph(AgentState)
-    graph.add_node("planner", _planner_node)
-    graph.add_node("generator", _generator_node)
-    graph.add_node("reviewer", _reviewer_node)
-    graph.set_entry_point("planner")
-    graph.add_edge("planner", "generator")
-    graph.add_edge("generator", "reviewer")
-    graph.add_edge("reviewer", END)
-    app = graph.compile()
-
-    initial_state: AgentState = {
-        "inventory": inv_dict,
-        "model": model,
-    }
-    result = await app.ainvoke(initial_state)
-
-    layers = [
-        LayerDoc(name=l["name"], filename=l["filename"], content=l["content"])
-        for l in result.get("layers", [])
-    ]
-    skills = [
-        SkillDoc(name=s["name"], directory=s["directory"], content=s["content"])
-        for s in result.get("skills", [])
-    ]
-    return RoutingSystem(
-        router_md=result.get("router_md", ""),
-        layers=layers,
-        skills=skills,
-    )
-
-
-# --- Public API ---
-
-async def analyze_repo(
-    inventory: RepoInventory,
-    model: str = "claude-sonnet-4-20250514",
-    backend: str = "direct",
-) -> RoutingSystem:
-    """Analyze a repo and produce a routing system."""
-    if backend == "langgraph":
-        return await analyze_repo_langgraph(inventory, model)
-    return await analyze_repo_direct(inventory, model)
-
-
-async def update_layer(
-    current_md: str,
-    changes: list[FileChange],
-    commits: list[dict[str, str]],
-    model: str = "claude-sonnet-4-20250514",
-) -> str:
-    """Update a layer document based on changes."""
-    return await update_layer_direct(current_md, changes, commits, model)
-
-
-async def query(
-    question: str,
-    router_md: str,
-    layer_contents: dict[str, str],
-    model: str = "claude-sonnet-4-20250514",
-) -> str:
-    """Answer a question using the routing system."""
-    return await query_direct(question, router_md, layer_contents, model)
+    return await _call_llm(prompt, model)
