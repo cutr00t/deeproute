@@ -1,11 +1,13 @@
 """Programmatic reader for v2 structured schema. Zero LLM calls.
 
 Loads and indexes JSON files from .deeproute/v2/ for fast lookup and search.
+Supports semantic search via embeddings when available.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from .schema import (
     PatternsSchema,
 )
 
+logger = logging.getLogger(__name__)
 V2_DIR = "v2"
 
 
@@ -32,6 +35,7 @@ class SchemaReader:
         self._config_files: ConfigFilesSchema | None = None
         self._patterns: PatternsSchema | None = None
         self._search_index: list[dict] | None = None
+        self._embedding_store: Any = None
 
     def has_v2(self) -> bool:
         return (self.v2_dir / "manifest.json").exists()
@@ -166,17 +170,49 @@ class SchemaReader:
                     })
         return results
 
+    def get_embedding_store(self):
+        """Get or create the embedding store for this repo."""
+        if self._embedding_store is None:
+            try:
+                from .embeddings import EmbeddingStore
+                self._embedding_store = EmbeddingStore(self.v2_dir)
+            except ImportError:
+                pass
+        return self._embedding_store
+
     def search(
         self,
         query: str = "",
         tags: list[str] | None = None,
         item_type: str = "",
         limit: int = 20,
+        semantic: bool = False,
     ) -> list[dict]:
         """Search across all schemas by text, tags, or type.
 
         item_type: "function", "class", "file", "endpoint", "pattern", "module"
+        semantic: if True and embeddings available, use cosine similarity for query matching
         """
+        # Semantic search path
+        if semantic and query and not tags:
+            store = self.get_embedding_store()
+            if store and store.available:
+                try:
+                    results = store.search(query, top_k=limit)
+                    semantic_results = []
+                    for meta, score in results:
+                        if item_type and meta.get("type", "") != item_type:
+                            continue
+                        result = dict(meta)
+                        result["_type"] = result.pop("type", "")
+                        result["_score"] = round(score, 3)
+                        semantic_results.append(result)
+                    if semantic_results:
+                        return semantic_results[:limit]
+                except Exception as e:
+                    logger.debug(f"Semantic search fallback to text: {e}")
+
+        # Text/tag search (original behavior)
         if self._search_index is None:
             self._build_search_index()
         assert self._search_index is not None

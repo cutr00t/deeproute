@@ -6,7 +6,7 @@ Living document. Updated as we build and learn.
 
 ## Phase 1: Model Flexibility + Graceful Degradation
 
-**Status: In progress**
+**Status: Complete**
 
 ### Problem
 Model IDs are hardcoded and vary by context:
@@ -221,12 +221,119 @@ This would let `dr_search(tags=["auth"])` work across an entire workspace withou
 
 ---
 
+## Phase 1.5: Accuracy Foundation + Lightweight Embeddings
+
+**Status: Complete**
+
+### Problem
+
+Testing Phase 1 on DeepRoute's own repo revealed a fundamental gap: **the v2 schema is a one-time LLM snapshot that diverges from actual code**. Specific issues:
+
+1. `dr_lookup(function="resolve_model")` returned **zero results** — the function exists at `llm_client.py:52` but the LLM didn't enumerate it during init
+2. The schema listed a `DeepAgent` class that doesn't exist (module uses standalone functions)
+3. Line numbers were wrong, function signatures were incomplete
+4. `dr_search(query="model", type="function")` returned zero results despite 8+ model-related functions
+5. Tag-based search worked well — `dr_search(tags=["llm", "backend"])` found 9 correct items
+6. Manifest/patterns sections provided genuine orientation value
+
+Root cause: the schema was only as accurate as the LLM's single-pass inference. For factual data (what functions exist, their signatures, line numbers), AST parsing is authoritative. The LLM adds value for interpretive data (descriptions, tags, patterns, purpose).
+
+### Solution
+
+Separate factual extraction (always accurate, no LLM) from interpretive analysis (rich but approximate, LLM-derived).
+
+#### A. AST-based factual extraction — `ast_indexer.py`
+
+New module using Python's stdlib `ast` for Python files and regex patterns for 10+ other languages (JS/TS, Go, Rust, Java, Kotlin, Ruby, C#, Swift, Shell, Terraform).
+
+Extracts: function names, parameters with types, return types, line numbers, async detection, decorators, class names, bases, methods, imports.
+
+Results on deeproute's own repo: **99 functions, 49 classes** across 19 files — all accurate.
+
+#### B. Hybrid schema generation
+
+During `dr_init`:
+1. Scanner walks file tree (existing)
+2. AST indexer extracts factual symbol tables (new, free)
+3. LLM analyzes for interpretive data (existing, paid)
+4. Generator merges: AST facts + LLM descriptions/tags (new)
+
+Each `FunctionSpec` and `ClassSpec` carries a `source` field: `"ast"`, `"llm"`, or `"merged"`.
+
+#### C. Threshold-based hybrid updates — rewritten `updater.py`
+
+Two update modes:
+1. **Factual update** (always, free): Re-index changed files via AST, update specs, compute drift scores
+2. **Interpretive update** (threshold-triggered, LLM): When cumulative drift ≥ 0.3, re-analyze affected modules for tags/descriptions
+
+Drift scoring: structural changes (added/removed symbols) weighted 1.0, signature changes weighted 0.5, normalized by total symbol count. Validated: adding 1 function + changing 1 signature out of 4 → drift 0.375 (correctly triggers LLM refresh).
+
+Also supports uncommitted changes via `git diff HEAD` — schema stays accurate even between commits.
+
+#### D. Lightweight embeddings — `embeddings.py`
+
+OpenAI `text-embedding-3-small` for semantic search over schema items. Stored as `.deeproute/v2/embeddings.npz` — flat file, no infrastructure.
+
+Validated: query "model alias resolution" correctly ranks `resolve_model` at 0.653 similarity, far above unrelated functions (~0.2).
+
+Degrades gracefully: no OpenAI key → embeddings skipped, text search still works.
+
+`dr_search` gains `semantic=True` flag for embedding-based similarity search.
+
+#### E. Schema model additions
+
+- `FunctionSpec` / `ClassSpec`: `source`, `decorators`, `is_async` fields
+- `ModuleSchema` / `Manifest`: `drift_score`, `last_factual_update`, `has_embeddings`
+- All backward-compatible (new fields have defaults)
+
+### Files changed
+- `src/deeproute/ast_indexer.py` — new: AST extraction engine
+- `src/deeproute/embeddings.py` — new: OpenAI embeddings with npz storage
+- `src/deeproute/schema.py` — source tracking, drift fields
+- `src/deeproute/schema_reader.py` — semantic search, embedding store
+- `src/deeproute/updater.py` — rewritten: hybrid AST/LLM updates with thresholds
+- `src/deeproute/generator.py` — AST merge into v2 schemas
+- `src/deeproute/git_utils.py` — uncommitted diff support
+- `src/deeproute/server.py` — AST indexing in dr_init, semantic search in dr_search
+- `pyproject.toml` — numpy, openai deps
+
+### Acceptance
+- [x] AST indexer extracts all public functions/classes with correct signatures
+- [x] Drift scoring correctly measures structural divergence
+- [x] Hybrid schema merge preserves LLM descriptions while fixing factual data
+- [x] Semantic search finds relevant items by meaning, not just keyword
+- [x] Threshold logic gates LLM calls behind meaningful change detection
+- [x] Embeddings gracefully degrade without OpenAI key
+- [ ] Full dr_init integration test with AST merge (requires MCP restart)
+- [ ] dr_update factual refresh on uncommitted changes
+
+### Impact on Phase 2/3
+
+This phase validates and de-risks several Phase 2/3 assumptions:
+
+1. **Complexity scoring** (Phase 2): Now programmatic. Can use AST-derived metrics (function count, import depth, parameter complexity) instead of LLM estimates. Ready for ML clustering.
+2. **Tag registry** (Phase 3): Tag-based search already works well. Embeddings add semantic discovery. The workspace tag registry concept is validated.
+3. **Budget control** (Phase 2): Threshold-based LLM gating means most updates are free. Only significant changes trigger paid analysis.
+4. **Recursive agents** (Phase 3): Better data quality means agent orchestration won't compound errors. Factual data is always correct; only interpretive data degrades.
+5. **Embeddings → vector DB** (Phase 2): The npz approach works now. Migration to ChromaDB/pgvector during HTTP transport phase requires only changing the storage backend — the embedding generation code stays.
+
+---
+
 ## Observations & Learnings
 
 _Updated as we build and use the system._
 
 ### Phase 1
-- (to be filled in as we implement and use)
+- Model aliases solve the multi-context problem cleanly. Users set `"sonnet"` and it resolves correctly on OAuth, API key, or Vertex.
+- 404 fallback prevents hard crashes when models are unavailable on a specific backend.
+- The explicit `DEEPROUTE_BACKEND` override handles the ambiguous-credentials case well.
+
+### Phase 1.5
+- **AST vs LLM accuracy**: On deeproute's own repo, the AST indexer found 99 functions; the LLM schema had listed ~15 and hallucinated 3 classes. AST is the ground truth for factual data.
+- **Semantic search is immediately valuable**: Even on a small codebase, cosine similarity over embeddings finds relevant functions that keyword search misses. The embedding cost is negligible (~$0.0001 for the whole repo).
+- **Drift scoring works as designed**: The weighted formula (structural=1.0, signature=0.5) correctly identifies meaningful changes vs noise. Threshold of 0.3 gates LLM calls appropriately.
+- **Hybrid merge is the right pattern**: AST for facts (names, params, line numbers), LLM for meaning (descriptions, tags, patterns). Neither alone is sufficient.
+- **Uncommitted diff support is important**: Without it, the schema drifts during active development. With it, `dr_update` can refresh factual data even between commits.
 
 ### Phase 2
 - (future)

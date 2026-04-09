@@ -80,19 +80,44 @@ async def dr_init(
     gc = load_global_config()
     init_model = model or gc.defaults.init_model or effective_model
 
+    # AST indexing (factual ground truth, no LLM)
+    from .ast_indexer import index_repo as ast_index_repo
+    file_infos = [{"path": f.path, "language": f.language} for f in inventory.files]
+    ast_indexes = ast_index_repo(p, file_infos)
+    ast_stats = {
+        "files_indexed": len(ast_indexes),
+        "functions_found": sum(len(idx.functions) for idx in ast_indexes.values()),
+        "classes_found": sum(len(idx.classes) for idx in ast_indexes.values()),
+    }
+
     # Analyze v1 (markdown)
     routing_system = await analyze_repo(inventory, effective_model)
 
     # Write v1
     written = write_routing_system(str(p), routing_system)
 
-    # Analyze + write v2 (structured schema)
+    # Analyze + write v2 (structured schema with AST merge)
     v2_written: list[str] = []
     try:
         v2_data = await analyze_repo_v2(inventory, init_model)
-        v2_written = write_v2_schema(str(p), v2_data, init_model)
+        v2_written = write_v2_schema(str(p), v2_data, init_model, ast_indexes=ast_indexes)
     except Exception as e:
         logger.warning(f"v2 schema generation failed (v1 still written): {e}")
+
+    # Build embeddings if OpenAI key available
+    embedding_count = 0
+    try:
+        from .embeddings import EmbeddingStore
+        from .schema_reader import SchemaReader
+        if EmbeddingStore.can_generate():
+            reader = SchemaReader(str(p))
+            if reader.has_v2():
+                reader._build_search_index()
+                if reader._search_index:
+                    store = EmbeddingStore(reader.v2_dir)
+                    embedding_count = store.build_from_index(reader._search_index)
+    except Exception as e:
+        logger.debug(f"Embedding generation skipped: {e}")
 
     # History
     head_sha = get_head_sha(str(p))
@@ -121,6 +146,8 @@ async def dr_init(
         "v2_files": v2_written,
         "model_used": effective_model,
         "init_model": init_model,
+        "ast_index": ast_stats,
+        "embeddings_generated": embedding_count,
     }
 
 
@@ -298,11 +325,21 @@ async def dr_status(path: str = "") -> dict:
     except Exception:
         backend = "unknown"
 
+    # Check for embeddings availability
+    from .embeddings import detect_embedding_backend, _BACKEND_CONFIG
+    emb_backend = detect_embedding_backend()
+    emb_config = _BACKEND_CONFIG.get(emb_backend, {})
+
     return {
         "defaults": gc.defaults.model_dump(),
         "llm_backend": backend,
         "model_resolved": model_display_name(resolve_model(gc.defaults.model)),
         "init_model_resolved": model_display_name(resolve_model(gc.defaults.init_model)),
+        "embeddings": {
+            "backend": emb_backend.value,
+            "model": emb_config.get("model"),
+            "dim": emb_config.get("dim"),
+        },
         "repos": repos_status,
         "workspaces": workspaces_status,
         "integrations": integration_status(),
@@ -455,6 +492,7 @@ async def dr_search(
     tags: list[str] | None = None,
     type: str = "",
     limit: int = 20,
+    semantic: bool = False,
 ) -> dict:
     """Search across the v2 structured schema by tags, types, or text.
 
@@ -463,6 +501,7 @@ async def dr_search(
     type: "function", "class", "file", "endpoint", "pattern", "module"
     tags: filter by tags, e.g. ["auth", "api"]
     query: text search across names, descriptions, tags
+    semantic: if True, use embedding-based similarity search (requires OpenAI key + embeddings)
     """
     from .schema_reader import SchemaReader
 
@@ -476,7 +515,9 @@ async def dr_search(
         reader = SchemaReader(t)
         if not reader.has_v2():
             continue
-        matches = reader.search(query=query, tags=tags, item_type=type, limit=limit)
+        matches = reader.search(
+            query=query, tags=tags, item_type=type, limit=limit, semantic=semantic,
+        )
         for m in matches:
             m["_repo"] = Path(t).name
         all_results.extend(matches)
@@ -485,6 +526,7 @@ async def dr_search(
         "success": True,
         "results": all_results[:limit],
         "total": len(all_results),
+        "search_mode": "semantic" if semantic else "text",
     }
 
 

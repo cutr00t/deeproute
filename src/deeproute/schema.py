@@ -39,6 +39,9 @@ class Manifest(BaseModel):
     generated_at: str = ""
     generated_by: str = ""
     has_notes: bool = False
+    drift_score: float = 0.0
+    last_factual_update: str = ""
+    has_embeddings: bool = False
 
 
 # --- Module detail ---
@@ -59,6 +62,9 @@ class FunctionSpec(BaseModel):
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     is_public: bool = True
+    source: str = "llm"  # "ast", "llm", or "merged"
+    decorators: list[str] = Field(default_factory=list)
+    is_async: bool = False
 
 
 class ClassSpec(BaseModel):
@@ -69,6 +75,7 @@ class ClassSpec(BaseModel):
     bases: list[str] = Field(default_factory=list)
     key_methods: list[FunctionSpec] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    source: str = "llm"  # "ast", "llm", or "merged"
 
 
 class FileRole(BaseModel):
@@ -103,6 +110,8 @@ class ModuleSchema(BaseModel):
     dependencies: list[ModuleDependency] = Field(default_factory=list)
     common_tasks: list[CommonTask] = Field(default_factory=list)
     notes_file: str = ""
+    drift_score: float = 0.0
+    last_factual_update: str = ""
 
 
 # --- Interfaces ---

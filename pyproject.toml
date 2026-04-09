@@ -12,6 +12,8 @@ dependencies = [
     "gitpython",
     "pydantic>=2",
     "anthropic[vertex]",
+    "numpy>=2.4.4",
+    "openai>=2.31.0",
 ]
 
 [build-system]
