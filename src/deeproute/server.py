@@ -596,6 +596,83 @@ async def dr_notes(
 
 
 @mcp.tool()
+async def dr_deep_analyze(
+    question: str,
+    path: str = "",
+    depth: int = 1,
+    parallel: bool = False,
+    synthesis_model: str = "sonnet",
+) -> dict:
+    """Multi-model deep analysis with complexity-driven orchestration.
+
+    Dispatches per-module LLM calls with model hints from complexity scoring,
+    then synthesizes results. Each module gets the right model for its
+    complexity: haiku for simple, sonnet for moderate, opus for complex.
+
+    question: what to analyze
+    depth: 1 = flat (one call per module), 2 = sub-component drill for complex modules
+    parallel: run module analyses concurrently (faster but harder to debug)
+    synthesis_model: model for the final synthesis step
+    """
+    from .orchestrator import deep_analyze
+    from .schema_reader import SchemaReader
+
+    gc = load_global_config()
+    targets = [str(Path(path).resolve())] if path else list(gc.repos.keys())
+    if not targets:
+        return {"success": False, "error": "No repos registered. Run dr_init first."}
+
+    # Collect all modules across target repos
+    all_modules = {}
+    for t in targets:
+        reader = _get_reader(t)
+        if not reader.has_v2():
+            continue
+        modules = reader.load_all_modules()
+        for mod_name, mod in modules.items():
+            # Skip config/docs modules — focus on code
+            if mod.complexity.score == 0 and not mod.functions and not mod.classes:
+                continue
+            all_modules[f"{Path(t).name}/{mod_name}"] = mod
+
+    if not all_modules:
+        return {"success": False, "error": "No modules with code found. Run dr_init first."}
+
+    tokens_before = token_tracker.total_tokens
+
+    result = await deep_analyze(
+        question=question,
+        modules=all_modules,
+        depth=depth,
+        synthesis_model=synthesis_model,
+        parallel=parallel,
+    )
+
+    return {
+        "success": True,
+        "answer": result.synthesis,
+        "modules_analyzed": len(result.module_analyses),
+        "depth_reached": result.depth_reached,
+        "total_tokens": result.total_tokens,
+        "total_cost": f"${result.total_cost:.4f}",
+        "models_used": result.models_used,
+        "elapsed_ms": result.elapsed_ms,
+        "per_module": [
+            {
+                "module": ma.module,
+                "model": ma.model_used,
+                "complexity": ma.complexity_score,
+                "key_findings": ma.key_findings,
+                "tokens": ma.tokens_used,
+                "sub_analyses": len(ma.sub_analyses),
+            }
+            for ma in result.module_analyses
+        ],
+        "token_usage_session": token_tracker.summary(),
+    }
+
+
+@mcp.tool()
 async def dr_plan(
     path: str = "",
     action: str = "init",

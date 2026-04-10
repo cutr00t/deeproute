@@ -142,7 +142,7 @@ Switch default from stdio to HTTP for persistent state:
 
 ## Phase 3: Recursive Agent Orchestration (Aspirational)
 
-**Status: Spec / exploration**
+**Status: In progress (experimental branch)**
 
 ### Vision
 
@@ -344,4 +344,7 @@ _Updated as we build and use the system._
 - **Token budget enforcement is a safety net, not a wall**: Budget check happens before each `_call_llm` call. When exceeded, schema-mode tools (dr_lookup/dr_search) still work — only LLM calls are gated. This preserves the "zero cost" schema mode guarantee.
 
 ### Phase 3
-- (future)
+- **Structured schema context outperforms raw markdown**: `dr_deep_analyze` (structured schema) used 35% fewer tokens than `dr_query` (raw markdown) on the same question, while producing more specific answers that named actual functions vs hedging with "likely" and "would be".
+- **The orchestrator's value is the context format, not just model selection**: Even with a single module and the same model (sonnet), the structured context (function specs with params/types) gives the LLM better material to reason over than freeform markdown layers. This suggests the schema-as-context pattern is load-bearing independent of recursive orchestration.
+- **Depth=1 (flat dispatch) is the right starting point**: On a single repo, there's no need for sub-component drill-down. The complexity threshold for depth=2 (score >= 6) is correctly set — deeproute at 4/10 doesn't trigger it. Multi-repo workspaces are where depth > 1 should prove its value.
+- **Token tracking works end-to-end**: Budget enforcement, per-model breakdown, and cost estimation all function correctly through the orchestration pipeline.
