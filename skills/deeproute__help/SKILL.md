@@ -1,6 +1,7 @@
 ---
 name: deeproute__help
 description: Interactive help for DeepRoute — explains tools, workflows, and troubleshooting based on current situation
+version: "2.0"
 triggers:
   - asking how to use deeproute
   - confused about deeproute tools
@@ -9,122 +10,78 @@ triggers:
   - wanting to know which deeproute tool to use
 ---
 
-# DeepRoute Help
+# DeepRoute Help (v2)
 
-You are a helpful guide for the DeepRoute MCP server system. Assess the user's situation and provide targeted advice.
+You are a helpful guide for the DeepRoute MCP server. Assess the user's situation and provide targeted advice.
 
-## What is DeepRoute?
+## System Overview
 
-DeepRoute is an MCP server that generates and maintains a **multi-layer markdown routing system** for codebases. It gives AI coding assistants fast, structured access to project knowledge instead of reading raw source files every time.
+DeepRoute combines three complementary approaches for codebase understanding:
 
-The core loop is: **scan repo → LLM-analyze → generate markdown docs → serve via MCP tools → keep in sync with git**.
+1. **AST extraction** (factual, free) — Extracts every function, class, param, return type from source code
+2. **LLM analysis** (interpretive, paid) — Adds descriptions, tags, patterns, architectural context
+3. **Embeddings** (semantic search, cheap) — Enables meaning-based code discovery
 
-## Available Tools (Quick Reference)
+## Quick Reference
 
-| Tool | When to use |
-|------|-------------|
-| `dr_init` | First time setting up a repo — scans everything and generates `.deeproute/` |
-| `dr_update` | After code changes — incrementally refreshes only what changed |
-| `dr_query` | Ask questions about the codebase using the routing system as context |
-| `dr_status` | Check what repos are registered, health, last update times |
-| `dr_register` | Add/remove a repo from tracking without running a full scan |
-| `dr_workspace_init` | Set up a multi-repo workspace (parent dir containing several git repos) |
-| `dr_install_skills` | Install Claude Code skills for automatic navigation and update behaviors |
-| `dr_config` | Read or change settings (model, excludes, auto-update, etc.) |
+| Tool | Cost | Use when |
+|------|------|----------|
+| `dr_lookup` | Free | Finding specific functions, classes, files, modules |
+| `dr_search` | Free | Cross-cutting search by tags, text, or semantic similarity |
+| `dr_notes` | Free | Getting deeper narrative context for a module |
+| `dr_plan` | Free | Preview costs before running operations |
+| `dr_status` | Free | Checking health, backends, token usage |
+| `dr_init` | Paid | First-time repo setup |
+| `dr_update` | Mostly free | Refresh after code changes (LLM only if drift > 0.3) |
+| `dr_query` | Paid | Complex questions needing LLM reasoning |
+| `dr_config` | Free | Get/set settings, token budget |
 
 ## Common Workflows
 
-### "I just cloned a repo and want to set it up"
-1. Run `dr_init` with the repo path
-2. It scans files, detects languages, reads key configs, then LLM-generates routing docs
-3. Check `.deeproute/ROUTER.md` to see the generated overview
-4. The repo is now registered and ready for `dr_query` and `dr_update`
+### "I want to understand this codebase"
+1. `dr_lookup section="manifest"` — project overview
+2. `dr_search query="<your question>" semantic=True` — find relevant code
+3. `dr_lookup module="<module>"` — drill into specific area
+4. `dr_notes module="<module>"` — deeper architectural context
 
-### "I have several repos that form one product"
-1. Put them under a common parent directory (or they already are)
-2. Run `dr_workspace_init` with the parent path
-3. Each repo gets its own `.deeproute/`, plus a workspace-level `ROUTER.md` for cross-repo routing
-4. `dr_query` will search across all repos when no specific path is given
+### "I need to find where X is implemented"
+1. `dr_lookup function="X"` or `dr_lookup class_name="X"` — exact name
+2. `dr_search query="X" semantic=True` — conceptual search
 
-### "I made code changes and want to refresh the docs"
-1. Run `dr_update` with the repo path (or omit path to update all registered repos)
-2. It diffs from the last known SHA, classifies changes, and only refreshes affected layers
-3. Structural changes (new dirs, config files) also update ROUTER.md
+### "I want to plan a workspace operation"
+1. `dr_plan action="init" path="/workspace"` — see costs before running
+2. Review per-module model selection and token estimates
+3. Proceed with `dr_init` or adjust models via `dr_config`
 
-### "I want to ask a question about the codebase"
-1. Use `dr_query` with your question
-2. Optional: set `depth` to control how much context is loaded:
-   - `shallow` — ROUTER.md only (fast orientation)
-   - `normal` — ROUTER.md + relevant layers (default, good for most questions)
-   - `deep` — All layers loaded (complex cross-cutting questions)
-3. If `auto_update_on_query` is enabled (default), it auto-refreshes stale repos first
+### "I want to control costs"
+1. `dr_config key="token_budget" value="50000"` — set limit
+2. `dr_status` — check current usage
+3. Use schema-mode tools (free) instead of `dr_query` (paid) when possible
 
-### "I want to change the LLM model used for analysis"
-```
-dr_config key="model" value="claude-sonnet-4-20250514"           # global
-dr_config key="model_override" value="claude-haiku-4-5-20251001" scope="repo" path="/path/to/repo"  # per-repo
-```
+## Data Accuracy
 
-### "I want to exclude certain directories from scanning"
-```
-dr_config key="exclude_patterns_extra" value='["vendor","generated"]' scope="repo" path="/path/to/repo"
-```
+- **`source="ast"`**: Ground truth from code parsing. Always accurate.
+- **`source="llm"`**: LLM-generated. May have wrong details.
+- **`source="merged"`**: AST facts + LLM descriptions. Best of both.
+- **`drift_score`**: 0.0 = fresh, 1.0 = completely stale. Run `dr_update` when > 0.3.
 
 ## Troubleshooting
 
-### "dr_init failed with 'not a git repo'"
-- DeepRoute requires a git repo with at least one commit
-- If the directory contains multiple repos, it auto-detects workspace mode
-- Run `git init && git add . && git commit -m "initial"` first if needed
+| Problem | Solution |
+|---------|----------|
+| "No v2 schema" | Run `dr_init` or `dr_migrate` |
+| Function not found in lookup | Schema may be stale — run `dr_update` |
+| Semantic search empty | Check `dr_status` embeddings section. Need OpenAI or Vertex key |
+| Model 404 errors | Use aliases (`sonnet`, `opus`, `haiku`) not full IDs |
+| Ambiguous backend | Set `DEEPROUTE_BACKEND=anthropic` or `vertex` |
+| Token budget exceeded | `dr_config key="token_reset" value="1"` or increase budget |
+| Schema stale (high drift) | `dr_update path="/path/to/repo"` |
 
-### "dr_update says 'no history found'"
-- The repo hasn't been initialized yet — run `dr_init` first
-- Or history.json was deleted — run `dr_init` again to regenerate
+## Environment Setup
 
-### "dr_query returns shallow/unhelpful answers"
-- Try `depth="deep"` to load all layers
-- Check that `.deeproute/layers/` has content: `ls .deeproute/layers/`
-- If layers are stale, run `dr_update` with `force=true` to regenerate
-
-### "I want to regenerate everything from scratch"
-- Delete `.deeproute/` and run `dr_init` again
-- Or run `dr_update` with `force=true` (will tell you to re-init if no history)
-
-### "The generated docs don't match my project well"
-- Check `.deeproute/config.json` for custom hints: `router_hints` lets you guide the LLM
-- Consider adding `custom_layers` in the repo config for domain-specific subsystems
-- The LLM model matters — Sonnet is the default; Opus produces richer analysis
-
-## Architecture (for contributors)
-
-```
-src/deeproute/
-├── server.py            # FastMCP server, 8 tool handlers
-├── models.py            # Pydantic models for all data structures
-├── config.py            # Global + per-repo config, registry
-├── scanner.py           # File tree walking, language detection, key file reading
-├── git_utils.py         # Git operations via GitPython (diff, log, SHA, discovery)
-├── deepagent.py         # LLM analysis — Anthropic SDK + optional LangGraph backend
-├── generator.py         # Writes .deeproute/ directory structure from LLM output
-├── updater.py           # Incremental update logic — git-diff-driven layer refresh
-└── skills_installer.py  # Installs Claude skills to ~/.claude/skills/
-```
-
-## Integration with Meta-Prompt Customization System
-
-If the user has the **meta-prompt customization framework** installed (`~/.claude/commands/customize.md` or `/customize-manage`), DeepRoute integrates naturally:
-
-- **Adding DeepRoute later**: Use `/customize-manage` and ask to add codebase navigation. It knows how to install and register DeepRoute as an MCP server.
-- **Existing commands work better with DeepRoute**: Commands like `/analyze`, `/impl`, `/plan` can read `.deeproute/ROUTER.md` to orient themselves faster in unfamiliar repos. When both systems are present, suggest reading ROUTER.md before deep analysis.
-- **`/help-agent` knows about DeepRoute**: If meta-prompt's help command is installed, it can recommend `dr_query` for codebase questions and `dr_init` for new repo setup.
-- **`dr_status` shows integration state**: Run `dr_status` to see whether meta-prompt is detected and which DeepRoute skills are installed.
-
-If meta-prompt is NOT installed, DeepRoute works fully standalone — no dependencies on the customization framework.
-
-## Tips
-
-- **Start simple**: `dr_init` on one repo, then `dr_query` to test. Expand to workspaces later.
-- **Let auto-update work**: The default `auto_update_on_query=true` keeps things fresh without manual `dr_update` calls.
-- **Read ROUTER.md directly**: The generated `.deeproute/ROUTER.md` is a great starting point even without the MCP tools — any AI assistant can read it as a file.
-- **Skills are optional**: The MCP tools work in any MCP client (Claude Code, Cursor, etc.). The Claude skills (`dr_install_skills`) just add automatic behaviors for Claude Code specifically.
-- **Works with or without meta-prompt**: DeepRoute is a standalone system. Meta-prompt integration is additive — it makes both better when they coexist.
+| Context | Required env vars |
+|---------|------------------|
+| Personal | `ANTHROPIC_API_KEY`, optionally `OPENAI_API_KEY` |
+| Work (GCP) | `CLOUD_ML_REGION`, `ANTHROPIC_VERTEX_PROJECT_ID` |
+| Schema only | None — just need `.deeproute/v2/` files |
+| Explicit | `DEEPROUTE_BACKEND`, `DEEPROUTE_EMBEDDING_BACKEND` |

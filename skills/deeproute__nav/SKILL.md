@@ -1,25 +1,83 @@
 ---
 name: deeproute__nav
-description: Navigate codebases using DeepRoute's multi-layer markdown routing system
+description: Navigate codebases using DeepRoute's hybrid schema system — AST-accurate lookups, semantic search, progressive disclosure
+version: "2.0"
 triggers:
   - navigating unfamiliar code
   - finding where something is implemented
   - understanding project structure
   - working across multiple repos
+  - looking for functions, classes, or patterns
 ---
 
-# DeepRoute Navigation
+# DeepRoute Navigation (v2)
 
-When working in a repo that has a `.deeproute/` directory, use this progressive disclosure pattern:
+When working in a repo with a `.deeproute/` directory, use this layered approach:
 
-1. **Start with ROUTER.md**: Read `.deeproute/ROUTER.md` first. It contains the project overview, directory map, and routing table.
+## 1. Orient with the manifest
 
-2. **Follow the routing table**: Match the current task to a row in the routing table. Load only the referenced layer file (e.g., `layers/backend.md`), NOT all layers.
+```
+dr_lookup section="manifest"
+```
 
-3. **Go deeper only when needed**: If the layer file references specific source files, read those. Don't read source files preemptively.
+Get the project overview: tech stack, module list, conventions, complexity level. This costs zero tokens.
 
-4. **Multi-repo**: If there's a workspace-level `.deeproute/ROUTER.md` in the parent directory, start there when working across repos.
+## 2. Find specific code
 
-5. **Prefer MCP tools**: If the `deeproute` MCP server is available, use `dr_query` for complex questions — it routes through the full DeepAgent with all context.
+**By name** (exact, AST-accurate):
+```
+dr_lookup function="function_name"
+dr_lookup class_name="ClassName"
+dr_lookup file="src/path/to/file.py"
+```
 
-6. **After changes**: After making significant code changes (new files, renamed modules, architectural shifts), call `dr_update` via MCP to keep the routing system current.
+**By concept** (semantic, embedding-based):
+```
+dr_search query="how does authentication work" semantic=True
+```
+
+**By tag** (cross-cutting):
+```
+dr_search tags=["auth", "middleware"]
+```
+
+All of these are zero-cost schema-mode operations.
+
+## 3. Drill into a module
+
+```
+dr_lookup module="src/app"
+```
+
+Returns: all files with roles, function specs (with parameter types, line numbers), class specs, complexity score, model hints, drift score. Source tracking shows whether data came from AST (factual) or LLM (interpretive).
+
+## 4. Get deeper context
+
+```
+dr_notes module="src/app"
+```
+
+Freeform markdown with architectural decisions, design context, deeper explanations.
+
+## 5. View patterns and interfaces
+
+```
+dr_lookup section="patterns"      # architectural patterns
+dr_lookup section="interfaces"    # HTTP endpoints, event handlers
+```
+
+## 6. Multi-repo navigation
+
+If there's a workspace registered:
+```
+dr_search tags=["database"] 
+```
+Searches across ALL registered repos. Use `dr_plan` to understand the workspace structure before diving into individual repos.
+
+## Key principles
+
+- **Start with `dr_lookup`/`dr_search`** — they're free and fast
+- **Use `semantic=True`** when you don't know exact names
+- **Check `source` field** on function/class specs: `"ast"` = factual ground truth, `"llm"` = interpretive
+- **Check `drift_score`** — if > 0.3, the schema may be stale. Run `dr_update`
+- Only use `dr_query` (LLM-powered) when schema-mode tools aren't enough
